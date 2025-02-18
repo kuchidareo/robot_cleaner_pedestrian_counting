@@ -71,9 +71,13 @@ class UltrasonicSensorServer extends NanoHTTPD {
                         currentTimestamp, hrs, minn, sec, mic, dis);
                 System.out.println(logMsg);
 
-                // Build the CSV filename (one file per minute)
+                String directoryPath = new File(".").getCanonicalPath() + File.separator + "sensordata";
+                File directory = new File(directoryPath);
+                if (!directory.exists()) {
+                    directory.mkdirs();
+                }
                 String fileName = "UltrasonicData_" + currentTimestamp + ".csv";
-                File file = new File(new File(".").getCanonicalPath() + File.separator + fileName);
+                File file = new File(directory, fileName);
 
                 // Append data to the CSV file
                 try (BufferedWriter out = new BufferedWriter(new FileWriter(file, true))) {
@@ -125,9 +129,13 @@ class PirSensorServer extends NanoHTTPD {
                         currentTimestamp, hrs, minn, sec, pirVal);
                 System.out.println(logMsg);
 
-                // Build the CSV filename (one file per minute)
+                String directoryPath = new File(".").getCanonicalPath() + File.separator + "sensordata";
+                File directory = new File(directoryPath);
+                if (!directory.exists()) {
+                    directory.mkdirs();
+                }
                 String fileName = "PIRData_" + currentTimestamp + ".csv";
-                File file = new File(new File(".").getCanonicalPath() + File.separator + fileName);
+                File file = new File(directory, fileName);
 
                 // Append data to the CSV file
                 try (BufferedWriter out = new BufferedWriter(new FileWriter(file, true))) {
