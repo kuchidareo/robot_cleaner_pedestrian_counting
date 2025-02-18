@@ -8,13 +8,14 @@
 #include <WiFiUdp.h>
 
 // === Global Constants ===
-const char* WIFI_SSID      = "ut-public";
-const char* WIFI_PASSWORD  = "";
+const char* WIFI_SSID = "<YOUR_WIFI_SSID>";
+const char* WIFI_PASSWORD = "<YOUR_WIFI_PASSWORD>";
+const char* IP_ADDRESS = "<YOUR_IP_ADDRESS>";
 const int   MIC_PIN        = 36;
 const long  UTC_OFFSET     = 7200; // in seconds
 
 // Server URL to send sensor data
-String SERVER_URL = "http://172.20.10.2:8080/upload";
+String SERVER_URL = "http://" + String(IP_ADDRESS) + ":8080/upload";
 
 // === Sensor and Utility Objects ===
 SONIC_I2C sonar;

@@ -4,9 +4,11 @@
 #include <NTPClient.h>
 
 // ----- WiFi & Server Configuration -----
-const char* WIFI_SSID      = "ut-public";
-const char* WIFI_PASSWORD  = "";
-String SERVER_URL          = "http://172.20.10.2:8090/upload";
+const char* WIFI_SSID = "<YOUR_WIFI_SSID>";
+const char* WIFI_PASSWORD = "<YOUR_WIFI_PASSWORD>";
+const char* IP_ADDRESS = "<YOUR_IP_ADDRESS>";
+
+String SERVER_URL = "http://" + String(IP_ADDRESS) + ":8090/upload";
 
 // ----- Time Configuration -----
 const long UTC_OFFSET_SECONDS = 7200; // UTC offset in seconds
