@@ -21,9 +21,9 @@ public class SensorDataServer {
 
     public static void main(String[] args) {
         try {
-            // Start server for ultrasonic and mic sensor data (port 8080);
+            // Start server for ultrasonic and mic sensor data (port 8080)
             UltrasonicSensorServer ultrasonicServer = new UltrasonicSensorServer(8080);
-            // Start server for PIR sensor data (port 8090);
+            // Start server for PIR sensor data (port 8090)
             PirSensorServer pirServer = new PirSensorServer(8090);
             System.out.println("Servers running:");
             System.out.println("Ultrasonic/Mic sensor server on port 8080 (endpoint: /upload)");
@@ -39,11 +39,28 @@ public class SensorDataServer {
  * Expected GET parameters: Hrs, minn, sec, mic, Dis
  */
 class UltrasonicSensorServer extends NanoHTTPD {
-    private static final DateFormat dateFormat = new SimpleDateFormat("yyyy_MM_dd_HH_mm");
+    private static final DateFormat dateFormat = new SimpleDateFormat("yyyy_MM_dd_HH_mm_ss");
     private static final String ENDPOINT = "/upload";
+    private static final String currentTimestamp = dateFormat.format(new Date());
+    private static final String FILE_NAME = "UltrasonicData_" + currentTimestamp + ".csv";
+    private final File dataFile;
 
     public UltrasonicSensorServer(int port) throws IOException {
         super(port);
+        // Ensure the data directory exists and create the single CSV file.
+        String directoryPath = new File(".").getCanonicalPath() + File.separator + "sensordata";
+        File directory = new File(directoryPath);
+        if (!directory.exists()) {
+            directory.mkdirs();
+        }
+        dataFile = new File(directory, FILE_NAME);
+        // Optionally create a header row if the file is new.
+        if (!dataFile.exists()) {
+            try (BufferedWriter out = new BufferedWriter(new FileWriter(dataFile, true))) {
+                out.write("Timestamp,Hrs,minn,sec,mic,Dis");
+                out.newLine();
+            }
+        }
         start(SOCKET_READ_TIMEOUT, false);
         System.out.println("Ultrasonic sensor server running on port " + port);
     }
@@ -65,23 +82,12 @@ class UltrasonicSensorServer extends NanoHTTPD {
                 String mic = params.get("mic");
                 String dis = params.get("Dis");
 
-                // Create a timestamp for logging and file naming
-                String currentTimestamp = dateFormat.format(new Date());
                 String logMsg = String.format("Ultrasonic Data (%s): %s:%s:%s | Mic: %s | Distance: %s",
                         currentTimestamp, hrs, minn, sec, mic, dis);
                 System.out.println(logMsg);
 
-                String directoryPath = new File(".").getCanonicalPath() + File.separator + "sensordata";
-                File directory = new File(directoryPath);
-                if (!directory.exists()) {
-                    directory.mkdirs();
-                }
-                String fileName = "UltrasonicData_" + currentTimestamp + ".csv";
-                File file = new File(directory, fileName);
-
-                // Append data to the CSV file
-                try (BufferedWriter out = new BufferedWriter(new FileWriter(file, true))) {
-                    // CSV columns: Hrs, minn, sec, mic, Dis
+                // Append data to the single CSV file
+                try (BufferedWriter out = new BufferedWriter(new FileWriter(dataFile, true))) {
                     out.write(hrs + "," + minn + "," + sec + "," + mic + "," + dis);
                     out.newLine();
                 }
@@ -99,11 +105,28 @@ class UltrasonicSensorServer extends NanoHTTPD {
  * Expected GET parameters: Hrs, minn, sec, PirVal
  */
 class PirSensorServer extends NanoHTTPD {
-    private static final DateFormat dateFormat = new SimpleDateFormat("yyyy_MM_dd_HH_mm");
+    private static final DateFormat dateFormat = new SimpleDateFormat("yyyy_MM_dd_HH_mm_ss");
     private static final String ENDPOINT = "/upload";
+    private static final String currentTimestamp = dateFormat.format(new Date());
+    private static final String FILE_NAME = "PIRData_" + currentTimestamp + ".csv";
+    private final File dataFile;
 
     public PirSensorServer(int port) throws IOException {
         super(port);
+        // Ensure the data directory exists and create the single CSV file.
+        String directoryPath = new File(".").getCanonicalPath() + File.separator + "sensordata";
+        File directory = new File(directoryPath);
+        if (!directory.exists()) {
+            directory.mkdirs();
+        }
+        dataFile = new File(directory, FILE_NAME);
+        // Optionally create a header row if the file is new.
+        if (!dataFile.exists()) {
+            try (BufferedWriter out = new BufferedWriter(new FileWriter(dataFile, true))) {
+                out.write("Timestamp,Hrs,minn,sec,PirVal");
+                out.newLine();
+            }
+        }
         start(SOCKET_READ_TIMEOUT, false);
         System.out.println("PIR sensor server running on port " + port);
     }
@@ -123,23 +146,12 @@ class PirSensorServer extends NanoHTTPD {
                 String sec = params.get("sec");
                 String pirVal = params.get("PirVal");
 
-                // Create a timestamp for logging and file naming
-                String currentTimestamp = dateFormat.format(new Date());
                 String logMsg = String.format("PIR Data (%s): %s:%s:%s | PirVal: %s",
                         currentTimestamp, hrs, minn, sec, pirVal);
                 System.out.println(logMsg);
 
-                String directoryPath = new File(".").getCanonicalPath() + File.separator + "sensordata";
-                File directory = new File(directoryPath);
-                if (!directory.exists()) {
-                    directory.mkdirs();
-                }
-                String fileName = "PIRData_" + currentTimestamp + ".csv";
-                File file = new File(directory, fileName);
-
-                // Append data to the CSV file
-                try (BufferedWriter out = new BufferedWriter(new FileWriter(file, true))) {
-                    // CSV columns: Hrs, minn, sec, PirVal
+                // Append data to the single CSV file
+                try (BufferedWriter out = new BufferedWriter(new FileWriter(dataFile, true))) {
                     out.write(hrs + "," + minn + "," + sec + "," + pirVal);
                     out.newLine();
                 }
