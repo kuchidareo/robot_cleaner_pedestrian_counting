@@ -18,9 +18,6 @@ def merge_data(sensor_df, annotation_df, config_list):
     sensor_df['timestamp'] = pd.to_datetime(sensor_df['timestamp'], unit='ns')
     annotation_df['timestamp'] = pd.to_datetime(annotation_df['timestamp'], unit='s')
 
-    # Remove unused column
-    # sensor_df.drop('source_directory', axis=1, inplace=True)
-    
     # Create a new event column initialized with NaN
     sensor_df['event'] = None
     sensor_df['is_turning'] = False
@@ -77,25 +74,19 @@ def calculate_turning_activity_stats(merged_df):
 
 def find_turning_threshold(merged_df, time_window='1s'):
     """
-    This function calculates the average norm of the gyroscope's angular velocity for each window,
+    This function calculates the average of the gyroscope's z-axis angular velocity for each window,
     and finds the threshold value that best matches the annotation using a simple search.
     It outputs the threshold value and its classification accuracy, and returns the threshold value.
     """
 
-    merged_df['gyroscope_norm'] = np.sqrt(
-        merged_df['gyroscope_x']**2 +
-        merged_df['gyroscope_y']**2 +
-        merged_df['gyroscope_z']**2
-    )
-
     merged_df['window_start'] = merged_df['timestamp'].dt.floor(time_window)
     
     agg_df = merged_df.groupby('window_start').agg(
-        window_gyroscope_norm=('gyroscope_norm', 'mean'),
+        window_gyroscope_z=('gyroscope_z', 'mean'),
         window_is_turning=('is_turning', lambda x: x.any())
     )
     
-    X = agg_df['window_gyroscope_norm'].values
+    X = agg_df['window_gyroscope_z'].values
     y = agg_df['window_is_turning'].astype(int).values
     
     thresholds = np.linspace(X.min(), X.max(), num=10000)
@@ -111,7 +102,7 @@ def find_turning_threshold(merged_df, time_window='1s'):
             
     print("Best threshold found: {:.4f} with accuracy: {:.2f}%".format(best_threshold, best_accuracy * 100))
 
-    agg_df['window_is_turning_pred'] = agg_df['window_gyroscope_norm'] >= best_threshold
+    agg_df['window_is_turning_pred'] = agg_df['window_gyroscope_z'] >= best_threshold
     new_df = merged_df.merge(agg_df, left_on='window_start', right_index=True, how='left')
     new_df = new_df[['timestamp', 'gyroscope_x', 'gyroscope_y', 'gyroscope_z', 'gyroscope_norm', 'is_turning', 'window_gyroscope_norm', 'window_is_turning', 'window_is_turning_pred', 'num_obstacles', 'trial']]
     
@@ -129,7 +120,7 @@ def main():
     # print(activity_stats)
     # activity_df.to_csv('activity_duration.csv', index=False)
 
-    # 1s, thresh = 0.1972 -> acc. 88.43%
+    # 1s, thresh = 0.0338 -> acc. 90.55%
     time_window = '1s'
     best_threshold, prediction_df = find_turning_threshold(merged_df, time_window)
     print(prediction_df.columns)
