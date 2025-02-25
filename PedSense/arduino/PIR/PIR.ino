@@ -1,5 +1,6 @@
 #include <M5Atom.h>
 #include <HTTPClient.h>
+#include <WiFi.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
 
