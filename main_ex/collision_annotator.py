@@ -69,7 +69,7 @@ def prompt_for_human_id():
     Blocks until a valid input (1-8) is provided, then returns it.
     """
     while True:
-        user_input = input("Enter standing human id (1-8): ")
+        user_input = input("Enter standing human id (1-8): ").strip()
         if user_input.isdigit() and 1 <= int(user_input) <= 8:
             return user_input
         else:
