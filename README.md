@@ -1,0 +1,5 @@
+- MainController handles
+    - Tharmal array (Front, Back)
+    - PIR sensor (Front)
+    - Distance sensor (Front)
+- Thermal3 is on the right. 4 is on the left.

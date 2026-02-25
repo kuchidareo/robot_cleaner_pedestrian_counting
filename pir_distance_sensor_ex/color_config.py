@@ -1,0 +1,4 @@
+FIRST_COLOR = "#db5461"
+SECOND_COLOAR = "#dbf1fa"
+THIRD_COLOR = "#ffe2bb"
+BLACK_COLOR = "#4c4c4c"
