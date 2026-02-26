@@ -4,8 +4,7 @@
 #include <WiFi.h>
 #include <WebSocketsServer.h>
 #include "M5_STHS34PF80.h"
-
-#include <esp_now.h>
+#include <Unit_Sonic.h>
 
 // ——— Configuration ————————————————————————————
 /*static const char*   WIFI_SSID     = "";
@@ -16,10 +15,12 @@ static const char*   WIFI_PASSWORD = "shutakjp";
 
 static const uint8_t WS_PORT       = 81;
 static const uint8_t I2C_MUX_ADDR  = 0x70;  // TCA9548A address
-const int MIC_PIN = 36;
 
 static const uint8_t MLX1_BUS      = 4;   // first camera
 static const uint8_t MLX2_BUS      = 0;   // second camera
+static const uint8_t SONAR_BUS     = 5;   // I2C mux channel for Unit_Sonic (adjust if wired differently)
+
+static const uint8_t PIR_PIN       = 32;  // Digital PIR input pin (set to your wiring)
 
 static const uint8_t MLX_I2C_ADDR  = 0x33;
 static const uint8_t MLX_COLS      = 32;
@@ -28,11 +29,16 @@ static const float   FRAME_DELAY   = 100;   // ms between frames
 
 int16_t motionVal        = 0;
 int16_t presenceVal      = 0;
+int16_t pirValue         = 0;   // Digital PIR (0/1)
 float   ambientTemp      = 0.0;
-float   distanceCm       = 0;
-int micValue    = 0;
-float gyroMagnitude = 0.0;
-float accelMagnitude = 0.0;
+float   distanceCm       = 0.0;
+// IMU values to transmit (converted units)
+float gyroX_dps = 0.0;
+float gyroY_dps = 0.0;
+float gyroZ_dps = 0.0;
+float accelX_mps2 = 0.0;
+float accelY_mps2 = 0.0;
+float accelZ_mps2 = 0.0;
 
 // ——— Globals ————————————————————————————————————————
 WebSocketsServer  webSocket(WS_PORT);
@@ -43,11 +49,28 @@ Adafruit_MLX90640 mlx2;
 float pixels1[MLX_COLS * MLX_ROWS];
 float pixels2[MLX_COLS * MLX_ROWS];
 
+// --- Compact binary packet (no CSV/JSON on-device) ---------------------------
+// Packet layout (little-endian):
+//  Header: uint16 cols, uint16 rows
+//  Meta:   int16 motion, int16 presence, int16 pir,
+//          float ambient, float distance_cm,
+//          float gyroX_dps, float gyroY_dps, float gyroZ_dps,
+//          float accelX_mps2, float accelY_mps2, float accelZ_mps2
+//  Data:   float pixels1[cols*rows], float pixels2[cols*rows]
+struct __attribute__((packed)) PacketHeader {
+  uint16_t cols;
+  uint16_t rows;
+};
+
+// Fixed packet sizing (compile-time)
+static constexpr size_t N_PIXELS = (size_t)MLX_COLS * (size_t)MLX_ROWS;
+static constexpr size_t BYTES_HEADER = sizeof(PacketHeader);
+static constexpr size_t BYTES_META   = sizeof(int16_t) * 3 + sizeof(float) * (2 + 6); // motion,presence,pir + (ambient,distance) + 6 IMU floats
+static constexpr size_t BYTES_DATA   = (N_PIXELS * sizeof(float)) * 2;                // two cameras
+static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_META + BYTES_DATA;
+
 M5_STHS34PF80           tmos;
-
-TaskHandle_t micTaskHandle = nullptr;
-
-
+SONIC_I2C sonar;
 
 // ——— Function Prototypes ————————————————————————
 void connectToWiFi();
@@ -59,11 +82,13 @@ void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_
 void broadcastThermalFrames();
 void readPIR();
 void readIMU();
+void readDistance();
 
 // ——— Setup ——————————————————————————————————————
 void setup() {
   M5.begin();
   Serial.begin(115200);
+  pinMode(PIR_PIN, INPUT);
 
   Wire.begin(/* SDA */ 32, /* SCL */ 33, 400000);
 
@@ -72,17 +97,7 @@ void setup() {
   
   initThermalCameras();
   initOtherSensors();
-
-  analogSetPinAttenuation(MIC_PIN, ADC_11db);  // extend range to full 3.3 V
-  xTaskCreatePinnedToCore(
-    micTask,             
-    "Mic Reader",        
-    2048,                
-    nullptr,             
-    2,                   // priority (higher than your main loop)
-    &micTaskHandle,      // handle
-    0                    // run on core 0 or 1 as you like
-  );
+  scanI2COnMux();
 
   webSocket.begin();
   webSocket.onEvent(handleWebSocketEvent);
@@ -93,6 +108,7 @@ void loop() {
   webSocket.loop();
   broadcastThermalFrames();
   readPIR();
+  readDistance();
   readIMU();
   delay(FRAME_DELAY);
 }
@@ -158,6 +174,10 @@ void initOtherSensors() {
   tmos.setMotionHysteresis(0x32);
   tmos.setPresenceHysteresis(0x32);
 
+  // Ultrasonic (Unit_Sonic) on its mux channel
+  selectI2CBus(SONAR_BUS);
+  sonar.begin();
+
 }
 
 // Selects which channel on the TCA9548A I2C multiplexer to use
@@ -173,10 +193,26 @@ void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_
 }
 
 void readPIR() {
+  // Digital PIR (0/1)
+  pirValue = (digitalRead(PIR_PIN) == HIGH) ? 1 : 0;
+
+  // STHS34PF80 (presence/motion/ambient) on mux bus 3
   selectI2CBus(3);
   tmos.getPresenceValue(&presenceVal);
   tmos.getMotionValue(&motionVal);
   tmos.getTemperatureData(&ambientTemp);
+}
+
+void readDistance() {
+  // Unit_Sonic returns distance in mm (raw). Convert to cm.
+  selectI2CBus(SONAR_BUS);
+  float rawDistance = sonar.getDistance();
+  distanceCm = rawDistance / 10.0f;
+
+  // Optional sanity clamp consistent with the reference sketch display logic
+  // if (!(distanceCm < 240.0f && distanceCm > 1.0f)) {
+  //   distanceCm = 250.0f; // mark as too far / invalid
+  // }
 }
 
 
@@ -187,29 +223,19 @@ void readIMU(){
   // Get gyroscope and accelerometer data
   M5.IMU.getGyroData(&gx, &gy, &gz);
   M5.IMU.getAccelData(&ax, &ay, &az);
-  
-  // Convert gyroscope data to deg/s
-  float gyroX = gx / 131.0;
-  float gyroY = gy / 131.0;
-  float gyroZ = gz / 131.0;
 
-  // Compute gyroscope magnitude
-  gyroMagnitude = sqrt(gyroX * gyroX + gyroY * gyroY + gyroZ * gyroZ);
+  // Convert gyroscope data to deg/s (library units depend on IMU configuration)
+  gyroX_dps = gx / 131.0;
+  gyroY_dps = gy / 131.0;
+  gyroZ_dps = gz / 131.0;
 
-  // Convert accelerometer data to m/s² (optional: only if needed)
-  float accelX = ax * 9.81;
-  float accelY = ay * 9.81;
-  float accelZ = az * 9.81;
-
-  // Compute accelerometer magnitude
-  accelMagnitude = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
+  // Convert accelerometer data to m/s²
+  accelX_mps2 = ax * 9.81;
+  accelY_mps2 = ay * 9.81;
+  accelZ_mps2 = az * 9.81;
 }
 
-
-
-
-
-// Reads one frame from the MLX90640, converts it to CSV, and broadcasts
+// Reads one frame from the MLX90640 and broadcasts as binary packet
 void broadcastThermalFrames() {
   // Read first camera
   selectI2CBus(MLX1_BUS);
@@ -224,38 +250,90 @@ void broadcastThermalFrames() {
     return;
   }
 
-  // build CSVs
-  String csv1, csv2;
-  csv1.reserve(MLX_ROWS * MLX_COLS * 6);
-  csv2.reserve(MLX_ROWS * MLX_COLS * 6);
-  for (int i = 0; i < MLX_ROWS * MLX_COLS; i++) {
-    if (i > 0) {
-      csv1 += ',';
-      csv2 += ',';
+  // Build a compact binary packet (no CSV/JSON here)
+  PacketHeader hdr;
+  hdr.cols     = MLX_COLS;
+  hdr.rows     = MLX_ROWS;
+
+  const int16_t motion   = motionVal;
+  const int16_t presence = presenceVal;
+  const int16_t pir      = pirValue;
+  const float   ambient  = ambientTemp;
+  const float   distance = distanceCm;
+
+  const float gX = gyroX_dps;
+  const float gY = gyroY_dps;
+  const float gZ = gyroZ_dps;
+  const float aX = accelX_mps2;
+  const float aY = accelY_mps2;
+  const float aZ = accelZ_mps2;
+
+  // Allocate a buffer on the stack (fixed size)
+  uint8_t buf[PACKET_BYTES];
+  size_t off = 0;
+
+  memcpy(buf + off, &hdr, sizeof(hdr));
+  off += sizeof(hdr);
+
+  memcpy(buf + off, &motion, sizeof(motion));
+  off += sizeof(motion);
+
+  memcpy(buf + off, &presence, sizeof(presence));
+  off += sizeof(presence);
+
+  memcpy(buf + off, &pir, sizeof(pir));
+  off += sizeof(pir);
+
+  memcpy(buf + off, &ambient, sizeof(ambient));
+  off += sizeof(ambient);
+
+  memcpy(buf + off, &distance, sizeof(distance));
+  off += sizeof(distance);
+
+  memcpy(buf + off, &gX, sizeof(gX));
+  off += sizeof(gX);
+  memcpy(buf + off, &gY, sizeof(gY));
+  off += sizeof(gY);
+  memcpy(buf + off, &gZ, sizeof(gZ));
+  off += sizeof(gZ);
+
+  memcpy(buf + off, &aX, sizeof(aX));
+  off += sizeof(aX);
+  memcpy(buf + off, &aY, sizeof(aY));
+  off += sizeof(aY);
+  memcpy(buf + off, &aZ, sizeof(aZ));
+  off += sizeof(aZ);
+
+  memcpy(buf + off, pixels1, N_PIXELS * sizeof(float));
+  off += N_PIXELS * sizeof(float);
+
+  memcpy(buf + off, pixels2, N_PIXELS * sizeof(float));
+  off += N_PIXELS * sizeof(float);
+
+  // Broadcast as binary
+  webSocket.broadcastBIN(buf, PACKET_BYTES);
+}
+
+
+// DEBUG
+void scanI2COnMux() {
+  Serial.println("=== I2C scan on each TCA9548A channel ===");
+  for (uint8_t ch = 0; ch < 8; ch++) {
+    selectI2CBus(ch);
+    delay(10);
+
+    Serial.printf("CH %u: ", ch);
+    bool foundAny = false;
+
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() == 0) {
+        Serial.printf("0x%02X ", addr);
+        foundAny = true;
+      }
     }
-    csv1 += String(pixels1[i], 2);
-    csv2 += String(pixels2[i], 2);
+    if (!foundAny) Serial.print("(none)");
+    Serial.println();
   }
-
-  // bundle into JSON with your other sensor values
-  String out = "{\"thermal1\":\"" + csv1 + "\"" +
-               ",\"thermal2\":\"" + csv2 + "\"" +
-               ",\"motion\":"   + String(motionVal) +
-               ",\"presence\":" + String(presenceVal) +
-               ",\"ambient\":"  + String(ambientTemp) +
-               ",\"micValue\":" + String(micValue) +
-               ",\"gyroMagnitude\":" + String(gyroMagnitude) +
-               ",\"accelMagnitude\":" + String(accelMagnitude) +
-               "}";
-  webSocket.broadcastTXT(out);
+  Serial.println("========================================");
 }
-
-void micTask(void *pv) {
-  const TickType_t sampleInterval = pdMS_TO_TICKS(10);
-
-  for (;;) {
-    micValue = analogRead(MIC_PIN);
-    vTaskDelay(sampleInterval);
-  }
-}
-

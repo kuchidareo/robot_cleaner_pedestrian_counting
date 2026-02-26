@@ -3,6 +3,26 @@
 #include <Adafruit_MLX90640.h>
 #include <WiFi.h>
 #include <WebSocketsServer.h>
+#include <string.h>
+
+// --- Compact binary packet (single thermal frame) ---------------------------
+// Packet layout (little-endian):
+//  Header: uint16 cols, uint16 rows
+//  Data:   float pixels[cols*rows]
+struct __attribute__((packed)) PacketHeader {
+  uint16_t cols;
+  uint16_t rows;
+};
+
+static const uint16_t MLX_COLS = 32;
+static const uint16_t MLX_ROWS = 24;
+
+static constexpr size_t N_PIXELS     = (size_t)MLX_COLS * (size_t)MLX_ROWS;
+static constexpr size_t BYTES_HEADER = sizeof(PacketHeader);
+static constexpr size_t BYTES_DATA   = N_PIXELS * sizeof(float);
+static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_DATA;
+
+float pixels1[MLX_COLS * MLX_ROWS];  // MLX90640 resolution
 
 //———————— WiFi Credentials ——————————
 /*static const char* WIFI_SSID     = "";
@@ -17,7 +37,6 @@ WebSocketsServer webSocket(WS_PORT);
 
 //———————— MLX90640 Thermal Sensor ——————————
 Adafruit_MLX90640 mlx;
-float frame[32 * 24];  // MLX90640 resolution
 
 //———————— Function Prototypes ——————————
 void connectToWiFi();
@@ -60,22 +79,27 @@ void loop() {
   const unsigned long interval = 250;  // Send every 250 ms (~4 FPS)
 
   if (millis() - lastSend >= interval) {
-    if (mlx.getFrame(frame) != 0) {
+    if (mlx.getFrame(pixels1) != 0) {
       Serial.println("Failed to get frame");
       return;
     }
 
-    // Convert thermal frame to CSV string
-    String payload = "";
-    for (int i = 0; i < 32 * 24; i++) {
-      payload += String(frame[i], 2);
-      if (i < (32 * 24 - 1)) payload += ",";
-    }
+    // Build a compact binary packet (no CSV/JSON here)
+    PacketHeader hdr;
+    hdr.cols     = MLX_COLS;
+    hdr.rows     = MLX_ROWS;
 
-    // Send data over WebSocket
-    webSocket.broadcastTXT(payload);
-    IPAddress ip = WiFi.localIP();
-    Serial.printf("IP address: %s\n", ip.toString().c_str());
+    uint8_t buf[PACKET_BYTES];
+    size_t off = 0;
+
+    memcpy(buf + off, &hdr, sizeof(hdr));
+    off += sizeof(hdr);
+
+    memcpy(buf + off, pixels1, N_PIXELS * sizeof(float));
+    off += N_PIXELS * sizeof(float);
+
+    // Send data over WebSocket (binary)
+    webSocket.broadcastBIN(buf, PACKET_BYTES);
 
     lastSend = millis();
   }
@@ -91,6 +115,8 @@ void connectToWiFi() {
     delay(500);
   }
   Serial.println("\nWiFi connected");
+  IPAddress ip = WiFi.localIP();
+  Serial.printf("IP address: %s\n", ip.toString().c_str());
   delay(500);  // Allow time for M5.Lcd to initialize
 }
 
@@ -106,4 +132,3 @@ void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_
       break;
   }
 }
-
