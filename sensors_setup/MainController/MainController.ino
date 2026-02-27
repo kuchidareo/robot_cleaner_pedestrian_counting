@@ -17,11 +17,9 @@ static const uint8_t WS_PORT       = 81;
 static const uint8_t I2C_MUX_ADDR  = 0x70;  // TCA9548A address
 
 static const uint8_t MLX1_BUS      = 4;   // first camera
-static const uint8_t MLX2_BUS      = 0;   // second camera
 static const uint8_t SONAR_BUS     = 5;   // I2C mux channel for Unit_Sonic (adjust if wired differently)
 
-static const uint8_t PIR_PIN       = 32;  // Digital PIR input pin (set to your wiring)
-
+static const uint8_t PIR_BUS       = 3;   // I2C mux channel for PIR
 static const uint8_t MLX_I2C_ADDR  = 0x33;
 static const uint8_t MLX_COLS      = 32;
 static const uint8_t MLX_ROWS      = 24;
@@ -43,11 +41,9 @@ float accelZ_mps2 = 0.0;
 // ——— Globals ————————————————————————————————————————
 WebSocketsServer  webSocket(WS_PORT);
 
-// two separate camera objects and two buffers:
+// one thermal camera object and one buffer:
 Adafruit_MLX90640 mlx1;
-Adafruit_MLX90640 mlx2;
 float pixels1[MLX_COLS * MLX_ROWS];
-float pixels2[MLX_COLS * MLX_ROWS];
 
 // --- Compact binary packet (no CSV/JSON on-device) ---------------------------
 // Packet layout (little-endian):
@@ -56,7 +52,7 @@ float pixels2[MLX_COLS * MLX_ROWS];
 //          float ambient, float distance_cm,
 //          float gyroX_dps, float gyroY_dps, float gyroZ_dps,
 //          float accelX_mps2, float accelY_mps2, float accelZ_mps2
-//  Data:   float pixels1[cols*rows], float pixels2[cols*rows]
+//  Data:   float pixels1[cols*rows]
 struct __attribute__((packed)) PacketHeader {
   uint16_t cols;
   uint16_t rows;
@@ -66,7 +62,7 @@ struct __attribute__((packed)) PacketHeader {
 static constexpr size_t N_PIXELS = (size_t)MLX_COLS * (size_t)MLX_ROWS;
 static constexpr size_t BYTES_HEADER = sizeof(PacketHeader);
 static constexpr size_t BYTES_META   = sizeof(int16_t) * 3 + sizeof(float) * (2 + 6); // motion,presence,pir + (ambient,distance) + 6 IMU floats
-static constexpr size_t BYTES_DATA   = (N_PIXELS * sizeof(float)) * 2;                // two cameras
+static constexpr size_t BYTES_DATA   = (N_PIXELS * sizeof(float));                    // one camera
 static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_META + BYTES_DATA;
 
 M5_STHS34PF80           tmos;
@@ -83,12 +79,12 @@ void broadcastThermalFrames();
 void readPIR();
 void readIMU();
 void readDistance();
+void scanI2COnMux();
 
 // ——— Setup ——————————————————————————————————————
 void setup() {
   M5.begin();
   Serial.begin(115200);
-  pinMode(PIR_PIN, INPUT);
 
   Wire.begin(/* SDA */ 32, /* SCL */ 33, 400000);
 
@@ -149,16 +145,6 @@ void initThermalCameras() {
   mlx1.setMode(MLX90640_CHESS);
   mlx1.setResolution(MLX90640_ADC_18BIT);
   mlx1.setRefreshRate(MLX90640_8_HZ);
-
-  // Camera 2
-  selectI2CBus(MLX2_BUS);
-  if (!mlx2.begin(MLX_I2C_ADDR, &Wire)) {
-    Serial.println("Error: MLX90640 #2 not detected!");
-    while (1) delay(10);
-  }
-  mlx2.setMode(MLX90640_CHESS);
-  mlx2.setResolution(MLX90640_ADC_18BIT);
-  mlx2.setRefreshRate(MLX90640_8_HZ);
 }
 
 void initOtherSensors() {
@@ -166,7 +152,7 @@ void initOtherSensors() {
   M5.IMU.Init();
 
   // PIR/Temp on bus 3
-  selectI2CBus(3);
+  selectI2CBus(PIR_BUS);
   tmos.begin();
   tmos.setGainMode(STHS34PF80_GAIN_DEFAULT_MODE);
   tmos.setMotionThreshold(0xFF);
@@ -193,11 +179,8 @@ void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_
 }
 
 void readPIR() {
-  // Digital PIR (0/1)
-  pirValue = (digitalRead(PIR_PIN) == HIGH) ? 1 : 0;
-
   // STHS34PF80 (presence/motion/ambient) on mux bus 3
-  selectI2CBus(3);
+  selectI2CBus(PIR_BUS);
   tmos.getPresenceValue(&presenceVal);
   tmos.getMotionValue(&motionVal);
   tmos.getTemperatureData(&ambientTemp);
@@ -241,12 +224,6 @@ void broadcastThermalFrames() {
   selectI2CBus(MLX1_BUS);
   if (mlx1.getFrame(pixels1) != 0) {
     Serial.println("Error: failed to read MLX90640 #1");
-    return;
-  }
-  // Read second camera
-  selectI2CBus(MLX2_BUS);
-  if (mlx2.getFrame(pixels2) != 0) {
-    Serial.println("Error: failed to read MLX90640 #2");
     return;
   }
 
@@ -305,9 +282,6 @@ void broadcastThermalFrames() {
   off += sizeof(aZ);
 
   memcpy(buf + off, pixels1, N_PIXELS * sizeof(float));
-  off += N_PIXELS * sizeof(float);
-
-  memcpy(buf + off, pixels2, N_PIXELS * sizeof(float));
   off += N_PIXELS * sizeof(float);
 
   // Broadcast as binary
