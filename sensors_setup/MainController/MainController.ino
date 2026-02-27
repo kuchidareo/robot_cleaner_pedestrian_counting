@@ -12,17 +12,19 @@ static const char*   WIFI_PASSWORD = "";*/
 
 static const char*   WIFI_SSID     = "kalev-bitter-70";
 static const char*   WIFI_PASSWORD = "shutakjp";
-
 static const uint8_t WS_PORT       = 81;
+
 static const uint8_t I2C_MUX_ADDR  = 0x70;  // TCA9548A address
 
-static const uint8_t MLX1_BUS      = 4;   // first camera
-static const uint8_t MLX2_BUS      = 0;   // second camera
-static const uint8_t SONAR_BUS     = 5;   // I2C mux channel for Unit_Sonic (adjust if wired differently)
-
-static const uint8_t PIR_PIN       = 32;  // Digital PIR input pin (set to your wiring)
-
 static const uint8_t MLX_I2C_ADDR  = 0x33;
+static const uint8_t MLX1_BUS      = 0;   // first camera
+
+static const uint8_t SONAR_I2C_ADDR = 0x74;
+static const uint8_t SONAR_BUS     = 1;   // I2C mux channel for Unit_Sonic (adjust if wired differently)
+
+static const uint8_t PIR_I2C_ADDR  = 0x5A;
+static const uint8_t PIR_BUS       = 3;   // I2C mux channel for PIR
+
 static const uint8_t MLX_COLS      = 32;
 static const uint8_t MLX_ROWS      = 24;
 static const float   FRAME_DELAY   = 100;   // ms between frames
@@ -32,6 +34,7 @@ int16_t presenceVal      = 0;
 int16_t pirValue         = 0;   // Digital PIR (0/1)
 float   ambientTemp      = 0.0;
 float   distanceCm       = 0.0;
+
 // IMU values to transmit (converted units)
 float gyroX_dps = 0.0;
 float gyroY_dps = 0.0;
@@ -43,11 +46,11 @@ float accelZ_mps2 = 0.0;
 // ——— Globals ————————————————————————————————————————
 WebSocketsServer  webSocket(WS_PORT);
 
-// two separate camera objects and two buffers:
+// one thermal camera object and one buffer:
 Adafruit_MLX90640 mlx1;
-Adafruit_MLX90640 mlx2;
+M5_STHS34PF80 tmos;
+SONIC_I2C sonar;
 float pixels1[MLX_COLS * MLX_ROWS];
-float pixels2[MLX_COLS * MLX_ROWS];
 
 // --- Compact binary packet (no CSV/JSON on-device) ---------------------------
 // Packet layout (little-endian):
@@ -56,7 +59,7 @@ float pixels2[MLX_COLS * MLX_ROWS];
 //          float ambient, float distance_cm,
 //          float gyroX_dps, float gyroY_dps, float gyroZ_dps,
 //          float accelX_mps2, float accelY_mps2, float accelZ_mps2
-//  Data:   float pixels1[cols*rows], float pixels2[cols*rows]
+//  Data:   float pixels1[cols*rows]
 struct __attribute__((packed)) PacketHeader {
   uint16_t cols;
   uint16_t rows;
@@ -66,19 +69,18 @@ struct __attribute__((packed)) PacketHeader {
 static constexpr size_t N_PIXELS = (size_t)MLX_COLS * (size_t)MLX_ROWS;
 static constexpr size_t BYTES_HEADER = sizeof(PacketHeader);
 static constexpr size_t BYTES_META   = sizeof(int16_t) * 3 + sizeof(float) * (2 + 6); // motion,presence,pir + (ambient,distance) + 6 IMU floats
-static constexpr size_t BYTES_DATA   = (N_PIXELS * sizeof(float)) * 2;                // two cameras
+static constexpr size_t BYTES_DATA   = (N_PIXELS * sizeof(float));                    // one camera
 static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_META + BYTES_DATA;
 
-M5_STHS34PF80           tmos;
-SONIC_I2C sonar;
+
 
 // ——— Function Prototypes ————————————————————————
 void connectToWiFi();
 void initDisplay();
 void initThermalCameras();
-void selectI2CBus(uint8_t bus);
+void selectMux(uint8_t ch);
+void scanI2COnMux();
 void initOtherSensors();
-void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length);
 void broadcastThermalFrames();
 void readPIR();
 void readIMU();
@@ -88,16 +90,16 @@ void readDistance();
 void setup() {
   M5.begin();
   Serial.begin(115200);
-  pinMode(PIR_PIN, INPUT);
 
   Wire.begin(/* SDA */ 32, /* SCL */ 33, 400000);
 
   connectToWiFi();
   initDisplay();
+  scanI2COnMux();
   
   initThermalCameras();
   initOtherSensors();
-  scanI2COnMux();
+
 
   webSocket.begin();
   webSocket.onEvent(handleWebSocketEvent);
@@ -106,14 +108,27 @@ void setup() {
 // ——— Main Loop ————————————————————————————————————
 void loop() {
   webSocket.loop();
-  broadcastThermalFrames();
   readPIR();
   readDistance();
   readIMU();
+  broadcastThermalFrames();
   delay(FRAME_DELAY);
 }
 
+void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    Serial.printf("[WS] client #%u connected\n", num);
+  } else if (type == WStype_DISCONNECTED) {
+    Serial.printf("[WS] client #%u disconnected\n", num);
+  }
+}
 // ——— Implementations ———————————————————————————
+// Selects which channel on the TCA9548A I2C multiplexer to use
+void selectMux(uint8_t ch) {
+  Wire.beginTransmission(I2C_MUX_ADDR);
+  Wire.write(1 << ch);
+  Wire.endTransmission();
+}
 
 // Connects to WiFi and prints the IP on Serial
 void connectToWiFi() {
@@ -140,8 +155,7 @@ void initDisplay() {
 
 // Initializes the MLX90640 sensor over the I2C multiplexer
 void initThermalCameras() {
-  // Camera 1
-  selectI2CBus(MLX1_BUS);
+  selectMux(MLX1_BUS);
   if (!mlx1.begin(MLX_I2C_ADDR, &Wire)) {
     Serial.println("Error: MLX90640 #1 not detected!");
     while (1) delay(10);
@@ -149,55 +163,51 @@ void initThermalCameras() {
   mlx1.setMode(MLX90640_CHESS);
   mlx1.setResolution(MLX90640_ADC_18BIT);
   mlx1.setRefreshRate(MLX90640_8_HZ);
-
-  // Camera 2
-  selectI2CBus(MLX2_BUS);
-  if (!mlx2.begin(MLX_I2C_ADDR, &Wire)) {
-    Serial.println("Error: MLX90640 #2 not detected!");
-    while (1) delay(10);
-  }
-  mlx2.setMode(MLX90640_CHESS);
-  mlx2.setResolution(MLX90640_ADC_18BIT);
-  mlx2.setRefreshRate(MLX90640_8_HZ);
 }
 
 void initOtherSensors() {
 
+  // DEBUG
+  // for (int ch=0; ch<8; ch++) {
+  //   selectMux(I2C_MUX_ADDR, ch);
+  //   delay(2);
+  //   Serial.printf("CH%d:\n", ch);
+  //   for (uint8_t a=1; a<127; a++) {
+  //     Wire.beginTransmission(a);
+  //     uint8_t e = Wire.endTransmission();
+  //     if (e==0) Serial.printf("  found 0x%02X\n", a);
+  //   }
+
+  //   for (int ch=0; ch<8; ch++) {
+  //     selectMux(SONAR_I2C_ADDR, ch);
+  //     Serial.printf("MUX2 CH%d:\n", ch);
+  //     for (uint8_t a=1; a<127; a++) {
+  //       Wire.beginTransmission(a);
+  //       uint8_t e = Wire.endTransmission();
+  //       if (e==0) Serial.printf("  found 0x%02X\n", a);
+  //     }
+  //   }
+  // }
+
   M5.IMU.Init();
 
-  // PIR/Temp on bus 3
-  selectI2CBus(3);
-  tmos.begin();
+  // PIR/Temp
+  selectMux(PIR_BUS);
+  tmos.begin(&Wire, PIR_I2C_ADDR);
   tmos.setGainMode(STHS34PF80_GAIN_DEFAULT_MODE);
   tmos.setMotionThreshold(0xFF);
   tmos.setPresenceThreshold(0xC8);
   tmos.setMotionHysteresis(0x32);
   tmos.setPresenceHysteresis(0x32);
 
-  // Ultrasonic (Unit_Sonic) on its mux channel
-  selectI2CBus(SONAR_BUS);
-  sonar.begin();
-
-}
-
-// Selects which channel on the TCA9548A I2C multiplexer to use
-void selectI2CBus(uint8_t bus) {
-  Wire.beginTransmission(I2C_MUX_ADDR);
-  Wire.write(1 << bus);
-  Wire.endTransmission();
-}
-
-// WebSocket event handler (we only broadcast, so this is empty)
-void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
-  // No incoming messages handled
+  // Ultrasonic (Unit_Sonic)
+  selectMux(SONAR_BUS);
+  sonar.begin(&Wire, SONAR_I2C_ADDR);
 }
 
 void readPIR() {
-  // Digital PIR (0/1)
-  pirValue = (digitalRead(PIR_PIN) == HIGH) ? 1 : 0;
-
   // STHS34PF80 (presence/motion/ambient) on mux bus 3
-  selectI2CBus(3);
+  selectMux(PIR_BUS);
   tmos.getPresenceValue(&presenceVal);
   tmos.getMotionValue(&motionVal);
   tmos.getTemperatureData(&ambientTemp);
@@ -205,7 +215,7 @@ void readPIR() {
 
 void readDistance() {
   // Unit_Sonic returns distance in mm (raw). Convert to cm.
-  selectI2CBus(SONAR_BUS);
+  selectMux(SONAR_BUS);
   float rawDistance = sonar.getDistance();
   distanceCm = rawDistance / 10.0f;
 
@@ -214,7 +224,6 @@ void readDistance() {
   //   distanceCm = 250.0f; // mark as too far / invalid
   // }
 }
-
 
 void readIMU(){
   float gx, gy, gz;
@@ -238,15 +247,9 @@ void readIMU(){
 // Reads one frame from the MLX90640 and broadcasts as binary packet
 void broadcastThermalFrames() {
   // Read first camera
-  selectI2CBus(MLX1_BUS);
+  selectMux(MLX1_BUS);
   if (mlx1.getFrame(pixels1) != 0) {
     Serial.println("Error: failed to read MLX90640 #1");
-    return;
-  }
-  // Read second camera
-  selectI2CBus(MLX2_BUS);
-  if (mlx2.getFrame(pixels2) != 0) {
-    Serial.println("Error: failed to read MLX90640 #2");
     return;
   }
 
@@ -307,19 +310,15 @@ void broadcastThermalFrames() {
   memcpy(buf + off, pixels1, N_PIXELS * sizeof(float));
   off += N_PIXELS * sizeof(float);
 
-  memcpy(buf + off, pixels2, N_PIXELS * sizeof(float));
-  off += N_PIXELS * sizeof(float);
-
   // Broadcast as binary
   webSocket.broadcastBIN(buf, PACKET_BYTES);
 }
-
 
 // DEBUG
 void scanI2COnMux() {
   Serial.println("=== I2C scan on each TCA9548A channel ===");
   for (uint8_t ch = 0; ch < 8; ch++) {
-    selectI2CBus(ch);
+    selectMux(ch);
     delay(10);
 
     Serial.printf("CH %u: ", ch);

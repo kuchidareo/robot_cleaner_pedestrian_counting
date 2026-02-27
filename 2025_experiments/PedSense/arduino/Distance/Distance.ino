@@ -8,9 +8,9 @@
 #include <WiFiUdp.h>
 
 // === Global Constants ===
-const char* WIFI_SSID = "<YOUR_WIFI_SSID>";
-const char* WIFI_PASSWORD = "<YOUR_WIFI_PASSWORD>";
-const char* IP_ADDRESS = "<YOUR_IP_ADDRESS>";
+const char* WIFI_SSID = "kalev-bitter-70";
+const char* WIFI_PASSWORD = "shutakjp";
+const char* IP_ADDRESS = "192.168.121.188";
 const int   MIC_PIN        = 36;
 const long  UTC_OFFSET     = 7200; // in seconds
 
@@ -201,62 +201,3 @@ void sendSensorData() {
     http.end();
   }
 }
-
-/*
-// === Optional Accelerometer Functions ===
-
-// Initialize the ADXL345 accelerometer
-void initAccelerometer() {
-  byte deviceID = accel.readDeviceID();
-  if (deviceID != 0) {
-    Serial.print("Accelerometer Device ID: 0x");
-    Serial.println(deviceID, HEX);
-    delay(1000);
-  } else {
-    Serial.println("Failed to read accelerometer device ID");
-    while (1) { delay(100); }
-  }
-  
-  if (!accel.writeRate(ADXL345_RATE_200HZ)) {
-    Serial.println("Failed to set accelerometer rate");
-    while (1) { delay(100); }
-  }
-  
-  if (!accel.writeRange(ADXL345_RANGE_16G)) {
-    Serial.println("Failed to set accelerometer range");
-    while (1) { delay(100); }
-  }
-  
-  if (!accel.start()) {
-    Serial.println("Failed to start accelerometer");
-    while (1) { delay(100); }
-  }
-}
-
-// Read accelerometer values and display them
-void readAccelerometer() {
-  if (accel.update()) {
-    accelX = 1000 * accel.getX();
-    accelY = 1000 * accel.getY();
-    accelZ = 1000 * accel.getZ();
-    
-    M5.Lcd.fillRect(5, 80, 200, 20, BLACK);
-    M5.Lcd.setCursor(5, 80);
-    M5.Lcd.printf("X: %d", accelX);
-    M5.Lcd.setCursor(75, 80);
-    M5.Lcd.printf("Y: %d", accelY);
-    M5.Lcd.setCursor(140, 80);
-    M5.Lcd.printf("Z: %d", accelZ);
-    
-    Serial.print("Accel X: ");
-    Serial.print(accelX);
-    Serial.print("  Y: ");
-    Serial.print(accelY);
-    Serial.print("  Z: ");
-    Serial.println(accelZ);
-  } else {
-    Serial.println("Accelerometer update failed");
-    while (1) { delay(100); }
-  }
-}
-*/
