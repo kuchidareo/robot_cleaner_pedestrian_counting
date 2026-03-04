@@ -2,25 +2,25 @@
 #include <Wire.h>
 #include <Adafruit_MLX90640.h>
 #include <WiFi.h>
-#include <WebSocketsServer.h>
+#include <WebSocketsClient.h>
 #include "M5_STHS34PF80.h"
-#include <Unit_Sonic.h>
 
 // ——— Configuration ————————————————————————————
 /*static const char*   WIFI_SSID     = "";
 static const char*   WIFI_PASSWORD = "";*/
 
+// === WebSocket destination (receiver) ===
+static const char*   WS_HOST       = "192.168.121.188";
+static const char*   WS_PATH       = "/";
+static const uint16_t WS_PORT      = 81;
+
 static const char*   WIFI_SSID     = "kalev-bitter-70";
 static const char*   WIFI_PASSWORD = "shutakjp";
-static const uint8_t WS_PORT       = 81;
 
 static const uint8_t I2C_MUX_ADDR  = 0x70;  // TCA9548A address
 
 static const uint8_t MLX_I2C_ADDR  = 0x33;
 static const uint8_t MLX1_BUS      = 0;   // first camera
-
-static const uint8_t SONAR_I2C_ADDR = 0x74;
-static const uint8_t SONAR_BUS     = 1;   // I2C mux channel for Unit_Sonic (adjust if wired differently)
 
 static const uint8_t PIR_I2C_ADDR  = 0x5A;
 static const uint8_t PIR_BUS       = 3;   // I2C mux channel for PIR
@@ -31,9 +31,7 @@ static const float   FRAME_DELAY   = 100;   // ms between frames
 
 int16_t motionVal        = 0;
 int16_t presenceVal      = 0;
-int16_t pirValue         = 0;   // Digital PIR (0/1)
 float   ambientTemp      = 0.0;
-float   distanceCm       = 0.0;
 
 // IMU values to transmit (converted units)
 float gyroX_dps = 0.0;
@@ -44,19 +42,18 @@ float accelY_mps2 = 0.0;
 float accelZ_mps2 = 0.0;
 
 // ——— Globals ————————————————————————————————————————
-WebSocketsServer  webSocket(WS_PORT);
+WebSocketsClient  webSocket;
 
 // one thermal camera object and one buffer:
 Adafruit_MLX90640 mlx1;
 M5_STHS34PF80 tmos;
-SONIC_I2C sonar;
 float pixels1[MLX_COLS * MLX_ROWS];
 
 // --- Compact binary packet (no CSV/JSON on-device) ---------------------------
 // Packet layout (little-endian):
 //  Header: uint16 cols, uint16 rows
-//  Meta:   int16 motion, int16 presence, int16 pir,
-//          float ambient, float distance_cm,
+//  Meta:   int16 motion, int16 presence,
+//          float ambient,
 //          float gyroX_dps, float gyroY_dps, float gyroZ_dps,
 //          float accelX_mps2, float accelY_mps2, float accelZ_mps2
 //  Data:   float pixels1[cols*rows]
@@ -65,12 +62,21 @@ struct __attribute__((packed)) PacketHeader {
   uint16_t rows;
 };
 
-// Fixed packet sizing (compile-time)
+// NOTE: Keep this in sync with what `sendThermalPacket()` actually packs.
+// Packed meta fields (current):
+//   int16 motion, int16 presence,
+//   float ambient,
+//   float gyroX_dps, gyroY_dps, gyroZ_dps,
+//   float accelX_mps2, accelY_mps2, accelZ_mps2
 static constexpr size_t N_PIXELS = (size_t)MLX_COLS * (size_t)MLX_ROWS;
 static constexpr size_t BYTES_HEADER = sizeof(PacketHeader);
-static constexpr size_t BYTES_META   = sizeof(int16_t) * 3 + sizeof(float) * (2 + 6); // motion,presence,pir + (ambient,distance) + 6 IMU floats
-static constexpr size_t BYTES_DATA   = (N_PIXELS * sizeof(float));                    // one camera
+static constexpr size_t BYTES_META   = sizeof(int16_t) * 2 + sizeof(float) * 7; // 2 int16 + 7 floats
+static constexpr size_t BYTES_DATA   = (N_PIXELS * sizeof(float));               // one camera
 static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_META + BYTES_DATA;
+
+// Sanity check: header(4) + meta(32) + data(3072) = 3108 bytes for 32x24 floats
+static_assert(PACKET_BYTES == (sizeof(PacketHeader) + (sizeof(int16_t) * 2) + (sizeof(float) * 7) + (N_PIXELS * sizeof(float))),
+              "PACKET_BYTES mismatch: update BYTES_META/PACKET_BYTES to match sendThermalPacket()");
 
 
 
@@ -80,11 +86,10 @@ void initDisplay();
 void initThermalCameras();
 void selectMux(uint8_t ch);
 void scanI2COnMux();
-void initOtherSensors();
-void broadcastThermalFrames();
+bool readThermalFrames();
+void sendThermalPacket();
 void readPIR();
 void readIMU();
-void readDistance();
 
 // ——— Setup ——————————————————————————————————————
 void setup() {
@@ -101,25 +106,39 @@ void setup() {
   initOtherSensors();
 
 
-  webSocket.begin();
+  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(handleWebSocketEvent);
+  webSocket.setReconnectInterval(2000);
+  Serial.printf("[WS] connecting to ws://%s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
 }
 
 // ——— Main Loop ————————————————————————————————————
 void loop() {
   webSocket.loop();
+
   readPIR();
-  readDistance();
   readIMU();
-  broadcastThermalFrames();
+
+  if (readThermalFrames()) {
+    sendThermalPacket();
+  }
+
   delay(FRAME_DELAY);
 }
 
-void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  if (type == WStype_CONNECTED) {
-    Serial.printf("[WS] client #%u connected\n", num);
-  } else if (type == WStype_DISCONNECTED) {
-    Serial.printf("[WS] client #%u disconnected\n", num);
+void handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.println("[WS] connected");
+      break;
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] disconnected");
+      break;
+    case WStype_ERROR:
+      Serial.println("[WS] error");
+      break;
+    default:
+      break;
   }
 }
 // ——— Implementations ———————————————————————————
@@ -166,29 +185,6 @@ void initThermalCameras() {
 }
 
 void initOtherSensors() {
-
-  // DEBUG
-  // for (int ch=0; ch<8; ch++) {
-  //   selectMux(I2C_MUX_ADDR, ch);
-  //   delay(2);
-  //   Serial.printf("CH%d:\n", ch);
-  //   for (uint8_t a=1; a<127; a++) {
-  //     Wire.beginTransmission(a);
-  //     uint8_t e = Wire.endTransmission();
-  //     if (e==0) Serial.printf("  found 0x%02X\n", a);
-  //   }
-
-  //   for (int ch=0; ch<8; ch++) {
-  //     selectMux(SONAR_I2C_ADDR, ch);
-  //     Serial.printf("MUX2 CH%d:\n", ch);
-  //     for (uint8_t a=1; a<127; a++) {
-  //       Wire.beginTransmission(a);
-  //       uint8_t e = Wire.endTransmission();
-  //       if (e==0) Serial.printf("  found 0x%02X\n", a);
-  //     }
-  //   }
-  // }
-
   M5.IMU.Init();
 
   // PIR/Temp
@@ -199,10 +195,6 @@ void initOtherSensors() {
   tmos.setPresenceThreshold(0xC8);
   tmos.setMotionHysteresis(0x32);
   tmos.setPresenceHysteresis(0x32);
-
-  // Ultrasonic (Unit_Sonic)
-  selectMux(SONAR_BUS);
-  sonar.begin(&Wire, SONAR_I2C_ADDR);
 }
 
 void readPIR() {
@@ -211,18 +203,6 @@ void readPIR() {
   tmos.getPresenceValue(&presenceVal);
   tmos.getMotionValue(&motionVal);
   tmos.getTemperatureData(&ambientTemp);
-}
-
-void readDistance() {
-  // Unit_Sonic returns distance in mm (raw). Convert to cm.
-  selectMux(SONAR_BUS);
-  float rawDistance = sonar.getDistance();
-  distanceCm = rawDistance / 10.0f;
-
-  // Optional sanity clamp consistent with the reference sketch display logic
-  // if (!(distanceCm < 240.0f && distanceCm > 1.0f)) {
-  //   distanceCm = 250.0f; // mark as too far / invalid
-  // }
 }
 
 void readIMU(){
@@ -244,25 +224,26 @@ void readIMU(){
   accelZ_mps2 = az * 9.81;
 }
 
-// Reads one frame from the MLX90640 and broadcasts as binary packet
-void broadcastThermalFrames() {
-  // Read first camera
+// Reads one frame from the MLX90640 into the global pixels buffer.
+// Returns true if the frame was read successfully.
+bool readThermalFrames() {
   selectMux(MLX1_BUS);
   if (mlx1.getFrame(pixels1) != 0) {
     Serial.println("Error: failed to read MLX90640 #1");
-    return;
+    return false;
   }
+  return true;
+}
 
-  // Build a compact binary packet (no CSV/JSON here)
+// Builds and broadcasts the compact binary packet using the latest sensor values.
+void sendThermalPacket() {
   PacketHeader hdr;
-  hdr.cols     = MLX_COLS;
-  hdr.rows     = MLX_ROWS;
+  hdr.cols = MLX_COLS;
+  hdr.rows = MLX_ROWS;
 
   const int16_t motion   = motionVal;
   const int16_t presence = presenceVal;
-  const int16_t pir      = pirValue;
   const float   ambient  = ambientTemp;
-  const float   distance = distanceCm;
 
   const float gX = gyroX_dps;
   const float gY = gyroY_dps;
@@ -275,6 +256,12 @@ void broadcastThermalFrames() {
   uint8_t buf[PACKET_BYTES];
   size_t off = 0;
 
+  // Guard against accidental size mismatches (would cause stack smashing)
+  if (PACKET_BYTES > sizeof(buf)) {
+    Serial.printf("[ERR] PACKET_BYTES(%u) > buf(%u)\n", (unsigned)PACKET_BYTES, (unsigned)sizeof(buf));
+    return;
+  }
+
   memcpy(buf + off, &hdr, sizeof(hdr));
   off += sizeof(hdr);
 
@@ -284,14 +271,8 @@ void broadcastThermalFrames() {
   memcpy(buf + off, &presence, sizeof(presence));
   off += sizeof(presence);
 
-  memcpy(buf + off, &pir, sizeof(pir));
-  off += sizeof(pir);
-
   memcpy(buf + off, &ambient, sizeof(ambient));
   off += sizeof(ambient);
-
-  memcpy(buf + off, &distance, sizeof(distance));
-  off += sizeof(distance);
 
   memcpy(buf + off, &gX, sizeof(gX));
   off += sizeof(gX);
@@ -310,8 +291,14 @@ void broadcastThermalFrames() {
   memcpy(buf + off, pixels1, N_PIXELS * sizeof(float));
   off += N_PIXELS * sizeof(float);
 
+  // Final consistency check
+  if (off != PACKET_BYTES) {
+    Serial.printf("[ERR] Packed size mismatch: off=%u PACKET_BYTES=%u\n", (unsigned)off, (unsigned)PACKET_BYTES);
+    return;
+  }
+
   // Broadcast as binary
-  webSocket.broadcastBIN(buf, PACKET_BYTES);
+  webSocket.sendBIN(buf, PACKET_BYTES);
 }
 
 // DEBUG

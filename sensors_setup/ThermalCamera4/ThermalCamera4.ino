@@ -2,8 +2,26 @@
 #include <Wire.h>
 #include <Adafruit_MLX90640.h>
 #include <WiFi.h>
-#include <WebSocketsServer.h>
+#include <WebSocketsClient.h>
 #include <string.h>
+
+//———————— WiFi Credentials ——————————
+/*static const char* WIFI_SSID     = "";
+static const char* WIFI_PASSWORD = "";*/
+
+static const char* WIFI_SSID     = "kalev-bitter-70";
+static const char* WIFI_PASSWORD = "shutakjp";
+
+//———————— WebSocket Setup ——————————
+static const char*   WS_HOST       = "192.168.121.188";
+static const char*   WS_PATH       = "/";
+static const uint16_t WS_PORT      = 86;
+
+WebSocketsClient webSocket;
+Adafruit_MLX90640 mlx;
+static volatile bool wsConnected = false;
+
+const uint32_t SEND_INTERVAL_MS = 200;
 
 // --- Compact binary packet (single thermal frame) ---------------------------
 // Packet layout (little-endian):
@@ -22,25 +40,11 @@ static constexpr size_t BYTES_HEADER = sizeof(PacketHeader);
 static constexpr size_t BYTES_DATA   = N_PIXELS * sizeof(float);
 static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_DATA;
 
-float pixels1[MLX_COLS * MLX_ROWS];  // MLX90640 resolution
-
-//———————— WiFi Credentials ——————————
-/*static const char* WIFI_SSID     = "";
-static const char* WIFI_PASSWORD = "";*/
-
-static const char* WIFI_SSID     = "kalev-bitter-70";
-static const char* WIFI_PASSWORD = "shutakjp";
-
-//———————— WebSocket Setup ——————————
-static const uint8_t WS_PORT = 86;
-WebSocketsServer webSocket(WS_PORT);
-
-//———————— MLX90640 Thermal Sensor ——————————
-Adafruit_MLX90640 mlx;
-
 //———————— Function Prototypes ——————————
 void connectToWiFi();
-void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length);
+void onWsEvent(WStype_t type, uint8_t* payload, size_t length);
+
+float pixels1[MLX_COLS * MLX_ROWS];  // MLX90640 resolution
 
 void setup() {
   M5.begin();
@@ -66,43 +70,52 @@ void setup() {
 
   connectToWiFi(); // connect to WiFi
 
-  webSocket.begin();           // Start WebSocket server
-  webSocket.onEvent(handleWebSocketEvent);
+  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+  webSocket.onEvent(onWsEvent);
+  webSocket.setReconnectInterval(2000);
 
   Serial.printf("WebSocket server started on port %d\n", WS_PORT);
 }
 
 void loop() {
-  webSocket.loop();  // Handle WebSocket events
+  // Always service websocket frequently; handshake + ping/pong depends on this.
+  webSocket.loop();
 
-  static unsigned long lastSend = 0;
-  const unsigned long interval = 250;  // Send every 250 ms (~4 FPS)
-
-  if (millis() - lastSend >= interval) {
-    if (mlx.getFrame(pixels1) != 0) {
-      Serial.println("Failed to get frame");
-      return;
-    }
-
-    // Build a compact binary packet (no CSV/JSON here)
-    PacketHeader hdr;
-    hdr.cols     = MLX_COLS;
-    hdr.rows     = MLX_ROWS;
-
-    uint8_t buf[PACKET_BYTES];
-    size_t off = 0;
-
-    memcpy(buf + off, &hdr, sizeof(hdr));
-    off += sizeof(hdr);
-
-    memcpy(buf + off, pixels1, N_PIXELS * sizeof(float));
-    off += N_PIXELS * sizeof(float);
-
-    // Send data over WebSocket (binary)
-    webSocket.broadcastBIN(buf, PACKET_BYTES);
-
-    lastSend = millis();
+  // Don't do slow sensor reads or send data until the websocket is actually connected.
+  if (!wsConnected) {
+    delay(10);
+    return;
   }
+
+  if (mlx.getFrame(pixels1) != 0) {
+    Serial.println("Failed to get frame");
+    delay(10);
+    return;
+  }
+
+  // Build a compact binary packet (no CSV/JSON here)
+  PacketHeader hdr;
+  hdr.cols = MLX_COLS;
+  hdr.rows = MLX_ROWS;
+
+  uint8_t buf[PACKET_BYTES];
+  size_t off = 0;
+
+  memcpy(buf + off, &hdr, sizeof(hdr));
+  off += sizeof(hdr);
+
+  memcpy(buf + off, pixels1, N_PIXELS * sizeof(float));
+  off += N_PIXELS * sizeof(float);
+
+  // Sanity check: if this ever fails, we'd risk buffer issues.
+  if (off != PACKET_BYTES) {
+    Serial.printf("[ERR] Packed size mismatch: off=%u PACKET_BYTES=%u\n", (unsigned)off, (unsigned)PACKET_BYTES);
+    delay(10);
+    return;
+  }
+
+  webSocket.sendBIN(buf, PACKET_BYTES);
+  delay(SEND_INTERVAL_MS);
 }
 
 void connectToWiFi() {
@@ -115,19 +128,29 @@ void connectToWiFi() {
     delay(500);
   }
   Serial.println("\nWiFi connected");
+  delay(500);  // Allow time for M5.Lcd to initialize
   IPAddress ip = WiFi.localIP();
   Serial.printf("IP address: %s\n", ip.toString().c_str());
-  delay(500);  // Allow time for M5.Lcd to initialize
 }
 
-void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
+void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
-      Serial.printf("Client %u connected\n", client);
+      wsConnected = true;
+      Serial.printf("[WS] connected to %s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
       break;
+
     case WStype_DISCONNECTED:
-      Serial.printf("Client %u disconnected\n", client);
+      wsConnected = false;
+      Serial.println("[WS] disconnected");
       break;
+
+    case WStype_ERROR:
+      // payload content is library-dependent, but printing length helps.
+      wsConnected = false;
+      Serial.printf("[WS] error (len=%u)\n", (unsigned)length);
+      break;
+
     default:
       break;
   }
