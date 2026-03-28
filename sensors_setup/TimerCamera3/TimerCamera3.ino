@@ -10,7 +10,7 @@ static const char* WIFI_PASSWORD = "shutakjp";
 // WebSocket server settings
 static const char* WS_HOST       = "192.168.121.188";
 static const char* WS_PATH       = "/";
-static const uint16_t WS_PORT    = 87;
+static const uint16_t WS_PORT    = 89;
 
 static const uint32_t SEND_INTERVAL_MS = 333;
 
