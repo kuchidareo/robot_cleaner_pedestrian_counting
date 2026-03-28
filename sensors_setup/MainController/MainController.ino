@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include "M5_STHS34PF80.h"
+#include <math.h>
 
 // ——— Configuration ————————————————————————————
 /*static const char*   WIFI_SSID     = "";
@@ -48,6 +49,12 @@ WebSocketsClient  webSocket;
 Adafruit_MLX90640 mlx1;
 M5_STHS34PF80 tmos;
 float pixels1[MLX_COLS * MLX_ROWS];
+bool  hasThermalFrame = false;
+bool  thermalSensorAvailable = false;
+bool  pirSensorAvailable = false;
+static volatile bool wsConnected = false;
+bool  reportedMissingThermalSensor = false;
+uint32_t lastWsStatusLogMs = 0;
 
 // --- Compact binary packet (no CSV/JSON on-device) ---------------------------
 // Packet layout (little-endian):
@@ -62,7 +69,7 @@ struct __attribute__((packed)) PacketHeader {
   uint16_t rows;
 };
 
-// NOTE: Keep this in sync with what `sendThermalPacket()` actually packs.
+// NOTE: Keep this in sync with what `sendMainPacket()` actually packs.
 // Packed meta fields (current):
 //   int16 motion, int16 presence,
 //   float ambient,
@@ -76,7 +83,7 @@ static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_META + BYTES_DATA;
 
 // Sanity check: header(4) + meta(32) + data(3072) = 3108 bytes for 32x24 floats
 static_assert(PACKET_BYTES == (sizeof(PacketHeader) + (sizeof(int16_t) * 2) + (sizeof(float) * 7) + (N_PIXELS * sizeof(float))),
-              "PACKET_BYTES mismatch: update BYTES_META/PACKET_BYTES to match sendThermalPacket()");
+              "PACKET_BYTES mismatch: update BYTES_META/PACKET_BYTES to match sendMainPacket()");
 
 
 
@@ -84,12 +91,15 @@ static_assert(PACKET_BYTES == (sizeof(PacketHeader) + (sizeof(int16_t) * 2) + (s
 void connectToWiFi();
 void initDisplay();
 void initThermalCameras();
+void initThermalFrameBuffer();
+void initOtherSensors();
 void selectMux(uint8_t ch);
 void scanI2COnMux();
-bool readThermalFrames();
-void sendThermalPacket();
+bool readThermalFrame();
+void sendMainPacket();
 void readPIR();
 void readIMU();
+void handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t length);
 
 // ——— Setup ——————————————————————————————————————
 void setup() {
@@ -100,16 +110,17 @@ void setup() {
 
   connectToWiFi();
   initDisplay();
-  scanI2COnMux();
-  
-  initThermalCameras();
-  initOtherSensors();
-
 
   webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(handleWebSocketEvent);
   webSocket.setReconnectInterval(2000);
   Serial.printf("[WS] connecting to ws://%s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
+
+  scanI2COnMux();
+  
+  initThermalCameras();
+  initThermalFrameBuffer();
+  initOtherSensors();
 }
 
 // ——— Main Loop ————————————————————————————————————
@@ -119,8 +130,26 @@ void loop() {
   readPIR();
   readIMU();
 
-  if (readThermalFrames()) {
-    sendThermalPacket();
+  const bool thermalFrameUpdated = readThermalFrame();
+  if (!thermalFrameUpdated) {
+    if (thermalSensorAvailable) {
+      if (hasThermalFrame) {
+        Serial.println("Warning: thermal read failed, sending cached thermal frame");
+      } else {
+        Serial.println("Warning: thermal read failed, sending NaN thermal frame");
+      }
+    } else if (!reportedMissingThermalSensor) {
+      Serial.println("Warning: thermal sensor unavailable, continuing without thermal data");
+      reportedMissingThermalSensor = true;
+    }
+  }
+
+  sendMainPacket();
+
+  const uint32_t nowMs = millis();
+  if (!wsConnected && (nowMs - lastWsStatusLogMs >= 5000)) {
+    lastWsStatusLogMs = nowMs;
+    Serial.printf("[WS] waiting for connection to ws://%s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
   }
 
   delay(FRAME_DELAY);
@@ -129,13 +158,16 @@ void loop() {
 void handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
+      wsConnected = true;
       Serial.println("[WS] connected");
       break;
     case WStype_DISCONNECTED:
-      Serial.println("[WS] disconnected");
+      wsConnected = false;
+      Serial.printf("[WS] disconnected from ws://%s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
       break;
     case WStype_ERROR:
-      Serial.println("[WS] error");
+      wsConnected = false;
+      Serial.printf("[WS] error (len=%u)\n", (unsigned)length);
       break;
     default:
       break;
@@ -153,6 +185,7 @@ void selectMux(uint8_t ch) {
 void connectToWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);
 
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -176,16 +209,26 @@ void initDisplay() {
 void initThermalCameras() {
   selectMux(MLX1_BUS);
   if (!mlx1.begin(MLX_I2C_ADDR, &Wire)) {
-    Serial.println("Error: MLX90640 #1 not detected!");
-    while (1) delay(10);
+    thermalSensorAvailable = false;
+    Serial.println("Warning: MLX90640 #1 not detected, continuing without thermal sensor");
+    return;
   }
+  thermalSensorAvailable = true;
   mlx1.setMode(MLX90640_CHESS);
   mlx1.setResolution(MLX90640_ADC_18BIT);
   mlx1.setRefreshRate(MLX90640_8_HZ);
+  Serial.println("MLX90640 #1 initialized");
+}
+
+void initThermalFrameBuffer() {
+  for (size_t i = 0; i < N_PIXELS; ++i) {
+    pixels1[i] = NAN;
+  }
 }
 
 void initOtherSensors() {
   M5.IMU.Init();
+  Serial.println("IMU initialized");
 
   // PIR/Temp
   selectMux(PIR_BUS);
@@ -195,9 +238,18 @@ void initOtherSensors() {
   tmos.setPresenceThreshold(0xC8);
   tmos.setMotionHysteresis(0x32);
   tmos.setPresenceHysteresis(0x32);
+  pirSensorAvailable = true;
+  Serial.println("PIR sensor initialized");
 }
 
 void readPIR() {
+  if (!pirSensorAvailable) {
+    motionVal = 0;
+    presenceVal = 0;
+    ambientTemp = NAN;
+    return;
+  }
+
   // STHS34PF80 (presence/motion/ambient) on mux bus 3
   selectMux(PIR_BUS);
   tmos.getPresenceValue(&presenceVal);
@@ -224,19 +276,30 @@ void readIMU(){
   accelZ_mps2 = az * 9.81;
 }
 
-// Reads one frame from the MLX90640 into the global pixels buffer.
-// Returns true if the frame was read successfully.
-bool readThermalFrames() {
+// Reads one frame from the MLX90640 into the cached pixels buffer.
+// Returns true only when a fresh frame was captured successfully.
+bool readThermalFrame() {
+  if (!thermalSensorAvailable) {
+    return false;
+  }
+
   selectMux(MLX1_BUS);
   if (mlx1.getFrame(pixels1) != 0) {
     Serial.println("Error: failed to read MLX90640 #1");
     return false;
   }
+  hasThermalFrame = true;
   return true;
 }
 
 // Builds and broadcasts the compact binary packet using the latest sensor values.
-void sendThermalPacket() {
+// Thermal data is sent from the cached frame buffer so a failed MLX read does not
+// block PIR/IMU transmission. Before the first successful read the buffer contains NaNs.
+void sendMainPacket() {
+  if (!wsConnected) {
+    return;
+  }
+
   PacketHeader hdr;
   hdr.cols = MLX_COLS;
   hdr.rows = MLX_ROWS;
