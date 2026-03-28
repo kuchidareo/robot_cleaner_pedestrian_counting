@@ -9,6 +9,8 @@ from typing import Dict, Tuple, Union
 import numpy as np
 import websockets
 
+from annotation import AnnotationWriter
+
 # -----------------------------------------------------------------------------
 # Server listen ports (devices connect to this PC)
 # -----------------------------------------------------------------------------
@@ -334,6 +336,8 @@ async def main():
     out_dir = os.path.join(BASE_OUT_DIR, run_id)
     os.makedirs(out_dir, exist_ok=True)
     print(f"Output dir: {out_dir}")
+    annotation_writer = AnnotationWriter(out_dir)
+    annotation_writer.start()
 
     imu_csv = CsvSink(
         os.path.join(out_dir, "imu.csv"),
@@ -370,8 +374,10 @@ async def main():
         print(f"Listening: {sensor_name} on ws://0.0.0.0:{port}/")
 
     # Keep running forever
-    await asyncio.Future()
-
+    try:
+        await asyncio.Future()
+    finally:
+        annotation_writer.stop()
 
 if __name__ == "__main__":
     try:
