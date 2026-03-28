@@ -15,11 +15,15 @@ from annotation import AnnotationWriter
 # Server listen ports (devices connect to this PC)
 # -----------------------------------------------------------------------------
 SENSOR_PORTS = {
-    "main": 81,
+    "thermalcam1": 81,
     "distance": 82,
-    "cam2": 84,
-    "cam3": 85,
-    "cam4": 86,
+    "thermalcam2": 84,
+    "thermalcam3": 85,
+    "thermalcam4": 86,
+    "timercam1": 87,
+    "timercam2": 88,
+    "timercam3": 89,
+    "timercam4": 90,
 }
 
 BASE_OUT_DIR = os.path.join(os.path.dirname(__file__), "out")
@@ -45,11 +49,14 @@ DIST_ONLY = struct.Struct("<f")
 # float gyroX, gyroY, gyroZ,
 # float accelX, accelY, accelZ
 # => 2*int16 + 7 floats = 32 bytes
-META_MAIN = struct.Struct("<hh" + "f" * 7)  # 2*int16 + 7 floats
+META_MAIN = struct.Struct("<hh" + "f" * 7)
 
 # Fixed MLX size expected on the wire
 N_PIXELS = FRAME_WIDTH * FRAME_HEIGHT
 BYTES_THERMAL = N_PIXELS * 4
+
+THERMAL_SENSOR_NAMES = {"thermalcam1", "thermalcam2", "thermalcam3", "thermalcam4"}
+TIMERCAM_SENSOR_NAMES = {"timercam1", "timercam2", "timercam3", "timercam4"}
 
 
 @dataclass
@@ -69,14 +76,14 @@ def _floats_from_bytes(buf: bytes, offset: int, n: int) -> Union[np.ndarray, lis
     return np.frombuffer(buf, dtype="<f4", count=n, offset=offset)
 
 
-def parse_packet(sensor_name: str, buf: bytes) -> Tuple[int, int, int, Union[MainMeta, None], Union[np.ndarray, list], Union[np.ndarray, list, None]]:
+def parse_packet(
+    sensor_name: str, buf: bytes
+) -> Tuple[int, int, int, Union[MainMeta, None], Union[np.ndarray, list], Union[np.ndarray, list, None]]:
     """Decode packets from sensors.
 
     Returns: (version, cols, rows, meta_or_None, frame1, frame2_or_None)
-    - MainController sends: header + META_MAIN(32 bytes) + 1 thermal frame
-    - ThermalCamera2/3/4 send: header + 1 thermal frame
-
-    We disambiguate by expected total length.
+    - thermalcam1 sends: header + META_MAIN(32 bytes) + 1 thermal frame
+    - thermalcam2/3/4 send: header + 1 thermal frame
     """
     if len(buf) < HDR.size:
         raise ValueError(f"too short: {len(buf)}")
@@ -91,11 +98,9 @@ def parse_packet(sensor_name: str, buf: bytes) -> Tuple[int, int, int, Union[Mai
     if n != N_PIXELS:
         raise ValueError(f"unexpected dims: {cols}x{rows} expected {FRAME_WIDTH}x{FRAME_HEIGHT}")
 
-    # Expected sizes
     need_main = off + META_MAIN.size + BYTES_THERMAL
     need_thermal = off + BYTES_THERMAL
 
-    # MainController (no distance)
     if len(buf) == need_main:
         motion, presence, ambient, gx, gy, gz, ax, ay, az = META_MAIN.unpack_from(buf, off)
         meta = MainMeta(
@@ -113,7 +118,6 @@ def parse_packet(sensor_name: str, buf: bytes) -> Tuple[int, int, int, Union[Mai
         f1 = _floats_from_bytes(buf, off2, n)
         return version, cols, rows, meta, f1, None
 
-    # Thermal-only
     if len(buf) == need_thermal:
         f1 = _floats_from_bytes(buf, off, n)
         return version, cols, rows, None, f1, None
@@ -148,10 +152,7 @@ def _fmt(x: float) -> str:
 
 
 def thermal_row(ts: float, flat: Union[np.ndarray, list]) -> list:
-    if hasattr(flat, "tolist"):
-        vals = flat.tolist()
-    else:
-        vals = flat
+    vals = flat.tolist() if hasattr(flat, "tolist") else flat
     return [f"{ts:.6f}"] + [_fmt(float(v)) for v in vals]
 
 
@@ -197,12 +198,11 @@ async def sensor_handler(
     pir_csv: CsvSink,
     distance_csv: CsvSink,
     thermal_csv: Dict[str, CsvSink],
+    image_csv: Dict[str, CsvSink],
+    image_dir: Dict[str, str],
 ):
     rate = Rate()
     count = 0
-
-    # Some sensors may still send thermal frames as CSV text.
-    # Buffer 32-float rows until we have a full 32x24 frame.
     text_row_buf: list[float] = []
 
     def _try_parse_text_thermal(s: str) -> Union[np.ndarray, None]:
@@ -234,8 +234,9 @@ async def sensor_handler(
         distance_csv.flush()
         for sink in thermal_csv.values():
             sink.flush()
+        for sink in image_csv.values():
+            sink.flush()
 
-    # websockets v10 used (websocket, path); newer versions pass a single connection.
     path = ""
     try:
         if hasattr(websocket, "path"):
@@ -252,14 +253,26 @@ async def sensor_handler(
         async for msg in websocket:
             ts = time.time()
 
-            # TEXT thermal (CSV) fallback
             if isinstance(msg, str):
                 frame = _try_parse_text_thermal(msg)
                 if frame is None:
                     continue
                 version, cols, rows, meta, f1, f2 = 0, FRAME_WIDTH, FRAME_HEIGHT, None, frame, None
             else:
-                # Distance-only device: 4-byte float
+                if name in TIMERCAM_SENSOR_NAMES:
+                    filename = f"{name}_{int(ts * 1000000)}.jpg"
+                    file_path = os.path.join(image_dir[name], filename)
+                    with open(file_path, "wb") as fh:
+                        fh.write(msg)
+                    image_csv[name].write([f"{ts:.6f}", filename, str(len(msg))])
+
+                    count += 1
+                    fps = rate.tick()
+                    if count % PRINT_EVERY == 0:
+                        _flush_all()
+                        print(f"[{name}] fps~{fps:.2f} jpeg_bytes={len(msg)} saved={filename}")
+                    continue
+
                 if name == "distance" and len(msg) == DIST_ONLY.size:
                     (dcm,) = DIST_ONLY.unpack(msg)
                     distance_csv.write([f"{ts:.6f}", f"{float(dcm):.6f}"])
@@ -271,7 +284,6 @@ async def sensor_handler(
                         print(f"[{name}] fps~{fps:.2f} distance_cm={float(dcm):.2f}")
                     continue
 
-                # Thermal / main packets
                 try:
                     version, cols, rows, meta, f1, f2 = parse_packet(name, msg)
                 except Exception as e:
@@ -281,7 +293,6 @@ async def sensor_handler(
             count += 1
             fps = rate.tick()
 
-            # meta -> imu/pir
             if meta is not None:
                 imu_csv.write([
                     f"{ts:.6f}",
@@ -290,19 +301,11 @@ async def sensor_handler(
                 ])
                 pir_csv.write([f"{ts:.6f}", meta.motion, meta.presence, f"{meta.ambient:.6f}"])
 
-            # thermal -> per-sensor files
-            if name == "main":
-                thermal_csv["main"].write(thermal_row(ts, f1))
-            elif name == "cam2":
-                thermal_csv["cam2"].write(thermal_row(ts, f1))
-            elif name == "cam3":
-                thermal_csv["cam3"].write(thermal_row(ts, f1))
-            elif name == "cam4":
-                thermal_csv["cam4"].write(thermal_row(ts, f1))
+            if name in THERMAL_SENSOR_NAMES:
+                thermal_csv[name].write(thermal_row(ts, f1))
 
             if count % PRINT_EVERY == 0:
                 _flush_all()
-
                 mn, mx = flat_min_max(f1)
                 if meta is not None:
                     extra = (
@@ -316,7 +319,6 @@ async def sensor_handler(
                 print(f"[{name}] v{version} {cols}x{rows} fps~{fps:.2f} value[min,max]=({mn:.1f},{mx:.1f}){extra}")
 
     except websockets.ConnectionClosed as e:
-        # Helpful for debugging rapid connect/disconnect loops
         code = getattr(e, "code", None)
         reason = getattr(e, "reason", "")
         print(f"Disconnected: {name} from {peer} (code={code} reason={reason})")
@@ -331,11 +333,11 @@ async def sensor_handler(
 # -----------------------------------------------------------------------------
 
 async def main():
-    # Create a per-run output folder like out/20260304_1713
     run_id = time.strftime("%Y%m%d_%H%M", time.localtime())
     out_dir = os.path.join(BASE_OUT_DIR, run_id)
     os.makedirs(out_dir, exist_ok=True)
     print(f"Output dir: {out_dir}")
+
     annotation_writer = AnnotationWriter(out_dir)
     annotation_writer.start()
 
@@ -348,11 +350,16 @@ async def main():
 
     thermal_header = ["timestamp"] + [f"p{i}" for i in range(FRAME_WIDTH * FRAME_HEIGHT)]
     thermal_csv = {
-        "main": CsvSink(os.path.join(out_dir, "thermal_main.csv"), thermal_header),
-        "cam2": CsvSink(os.path.join(out_dir, "thermal_cam2.csv"), thermal_header),
-        "cam3": CsvSink(os.path.join(out_dir, "thermal_cam3.csv"), thermal_header),
-        "cam4": CsvSink(os.path.join(out_dir, "thermal_cam4.csv"), thermal_header),
+        name: CsvSink(os.path.join(out_dir, f"{name}.csv"), thermal_header)
+        for name in sorted(THERMAL_SENSOR_NAMES)
     }
+
+    image_csv = {}
+    image_dir = {}
+    for name in sorted(TIMERCAM_SENSOR_NAMES):
+        image_dir[name] = os.path.join(out_dir, name)
+        os.makedirs(image_dir[name], exist_ok=True)
+        image_csv[name] = CsvSink(os.path.join(out_dir, f"{name}.csv"), ["timestamp", "filename", "bytes"])
 
     servers = []
 
@@ -365,19 +372,19 @@ async def main():
                 pir_csv=pir_csv,
                 distance_csv=distance_csv,
                 thermal_csv=thermal_csv,
+                image_csv=image_csv,
+                image_dir=image_dir,
             )
 
-        # Some microcontroller websocket clients don't implement ping/pong correctly.
-        # Disable server-side pings to avoid rapid disconnect loops.
         server = await websockets.serve(_make_handler, host="0.0.0.0", port=port, ping_interval=None)
         servers.append(server)
         print(f"Listening: {sensor_name} on ws://0.0.0.0:{port}/")
 
-    # Keep running forever
     try:
         await asyncio.Future()
     finally:
         annotation_writer.stop()
+
 
 if __name__ == "__main__":
     try:
