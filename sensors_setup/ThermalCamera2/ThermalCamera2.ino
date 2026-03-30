@@ -16,6 +16,10 @@ static const char* WIFI_PASSWORD = "shutakjp";
 static const char*   WS_HOST       = "192.168.121.188";
 static const char*   WS_PATH       = "/";
 static const uint16_t WS_PORT      = 84;
+static const uint8_t I2C_SDA_PIN   = 32;
+static const uint8_t I2C_SCL_PIN   = 33;
+static const uint32_t I2C_FREQ_HZ  = 400000;
+static const uint8_t MLX_I2C_ADDR  = MLX90640_I2CADDR_DEFAULT;
 
 WebSocketsClient webSocket;
 Adafruit_MLX90640 mlx;
@@ -43,23 +47,26 @@ static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_DATA;
 //———————— Function Prototypes ——————————
 void connectToWiFi();
 void onWsEvent(WStype_t type, uint8_t* payload, size_t length);
+void scanI2C();
 
 float pixels1[MLX_COLS * MLX_ROWS];  // MLX90640 resolution
 
 void setup() {
   M5.begin();
-  Wire.begin(0, 26);  // SDA = GPIO0, SCL = GPIO26 for Thermal Hat
   Serial.begin(115200);
   esp_log_level_set("wifi", ESP_LOG_NONE);
   delay(1000);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
 
   M5.Lcd.setRotation(1);  
   M5.Lcd.setTextSize(2);    
   M5.Lcd.fillScreen(BLACK);
 
+  Serial.printf("Initializing I2C on SDA=%u SCL=%u @ %u Hz\n", I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
+  scanI2C();
   Serial.println("Initializing MLX90640...");
-  if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
-    Serial.println("Failed to find MLX90640 sensor!");
+  if (!mlx.begin(MLX_I2C_ADDR, &Wire)) {
+    Serial.printf("Failed to find MLX90640 sensor at 0x%02X\n", MLX_I2C_ADDR);
     while (1) delay(10);
   }
 
@@ -116,6 +123,22 @@ void loop() {
 
   webSocket.sendBIN(buf, PACKET_BYTES);
   delay(SEND_INTERVAL_MS);
+}
+
+void scanI2C() {
+  bool foundDevice = false;
+  Serial.println("Scanning I2C bus...");
+  for (uint8_t addr = 1; addr < 127; ++addr) {
+    Wire.beginTransmission(addr);
+    const uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      foundDevice = true;
+      Serial.printf("I2C device found at 0x%02X\n", addr);
+    }
+  }
+  if (!foundDevice) {
+    Serial.println("No I2C devices found");
+  }
 }
 
 void connectToWiFi() {
