@@ -2,7 +2,7 @@
 #include <Wire.h>
 #include <Adafruit_MLX90640.h>
 #include <WiFi.h>
-#include <WebSocketsClient.h>
+#include <WebSocketsServer.h>
 #include "M5_STHS34PF80.h"
 #include <math.h>
 
@@ -10,9 +10,7 @@
 /*static const char*   WIFI_SSID     = "";
 static const char*   WIFI_PASSWORD = "";*/
 
-// === WebSocket destination (receiver) ===
-static const char*   WS_HOST       = "192.168.121.188";
-static const char*   WS_PATH       = "/";
+// === WebSocket server settings ===
 static const uint16_t WS_PORT      = 81;
 
 static const char*   WIFI_SSID     = "kalev-bitter-70";
@@ -43,7 +41,7 @@ float accelY_mps2 = 0.0;
 float accelZ_mps2 = 0.0;
 
 // ——— Globals ————————————————————————————————————————
-WebSocketsClient  webSocket;
+WebSocketsServer  webSocket(WS_PORT);
 
 // one thermal camera object and one buffer:
 Adafruit_MLX90640 mlx1;
@@ -52,7 +50,7 @@ float pixels1[MLX_COLS * MLX_ROWS];
 bool  hasThermalFrame = false;
 bool  thermalSensorAvailable = false;
 bool  pirSensorAvailable = false;
-static volatile bool wsConnected = false;
+static volatile uint8_t wsClientCount = 0;
 bool  reportedMissingThermalSensor = false;
 uint32_t lastWsStatusLogMs = 0;
 
@@ -62,7 +60,7 @@ uint32_t lastWsStatusLogMs = 0;
 //  Meta:   int16 motion, int16 presence,
 //          float ambient,
 //          float gyroX_dps, float gyroY_dps, float gyroZ_dps,
-//          float accelX_mps2, float accelY_mps2, float accelZ_mps2
+//          float accelX_mps2, accelY_mps2, accelZ_mps2
 //  Data:   float pixels1[cols*rows]
 struct __attribute__((packed)) PacketHeader {
   uint16_t cols;
@@ -99,7 +97,7 @@ bool readThermalFrame();
 void sendMainPacket();
 void readPIR();
 void readIMU();
-void handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t length);
+void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
 
 // ——— Setup ——————————————————————————————————————
 void setup() {
@@ -111,10 +109,9 @@ void setup() {
   connectToWiFi();
   initDisplay();
 
-  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+  webSocket.begin();
   webSocket.onEvent(handleWebSocketEvent);
-  webSocket.setReconnectInterval(2000);
-  Serial.printf("[WS] connecting to ws://%s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
+  Serial.printf("[WS] listening on port %u\n", WS_PORT);
 
   scanI2COnMux();
   
@@ -147,27 +144,28 @@ void loop() {
   sendMainPacket();
 
   const uint32_t nowMs = millis();
-  if (!wsConnected && (nowMs - lastWsStatusLogMs >= 5000)) {
+  if (wsClientCount == 0 && (nowMs - lastWsStatusLogMs >= 5000)) {
     lastWsStatusLogMs = nowMs;
-    Serial.printf("[WS] waiting for connection to ws://%s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
+    Serial.printf("[WS] waiting for a client on port %u\n", WS_PORT);
   }
 
   delay(FRAME_DELAY);
 }
 
-void handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
-      wsConnected = true;
-      Serial.println("[WS] connected");
+      wsClientCount++;
+      Serial.printf("[WS] client #%u connected (clients=%u)\n", num, wsClientCount);
       break;
     case WStype_DISCONNECTED:
-      wsConnected = false;
-      Serial.printf("[WS] disconnected from ws://%s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
+      if (wsClientCount > 0) {
+        wsClientCount--;
+      }
+      Serial.printf("[WS] client #%u disconnected (clients=%u)\n", num, wsClientCount);
       break;
     case WStype_ERROR:
-      wsConnected = false;
-      Serial.printf("[WS] error (len=%u)\n", (unsigned)length);
+      Serial.printf("[WS] error from client #%u (len=%u)\n", num, (unsigned)length);
       break;
     default:
       break;
@@ -296,7 +294,7 @@ bool readThermalFrame() {
 // Thermal data is sent from the cached frame buffer so a failed MLX read does not
 // block PIR/IMU transmission. Before the first successful read the buffer contains NaNs.
 void sendMainPacket() {
-  if (!wsConnected) {
+  if (wsClientCount == 0) {
     return;
   }
 
@@ -361,7 +359,7 @@ void sendMainPacket() {
   }
 
   // Broadcast as binary
-  webSocket.sendBIN(buf, PACKET_BYTES);
+  webSocket.broadcastBIN(buf, PACKET_BYTES);
 }
 
 // DEBUG

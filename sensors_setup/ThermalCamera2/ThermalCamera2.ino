@@ -2,7 +2,7 @@
 #include <Wire.h>
 #include <Adafruit_MLX90640.h>
 #include <WiFi.h>
-#include <WebSocketsClient.h>
+#include <WebSocketsServer.h>
 #include <string.h>
 
 //———————— WiFi Credentials ——————————
@@ -13,13 +13,11 @@ static const char* WIFI_SSID     = "kalev-bitter-70";
 static const char* WIFI_PASSWORD = "shutakjp";
 
 //———————— WebSocket Setup ——————————
-static const char*   WS_HOST       = "192.168.121.188";
-static const char*   WS_PATH       = "/";
-static const uint16_t WS_PORT      = 84;
+static const uint16_t WS_PORT = 84;
 
-WebSocketsClient webSocket;
+WebSocketsServer webSocket(WS_PORT);
 Adafruit_MLX90640 mlx;
-static volatile bool wsConnected = false;
+static volatile uint8_t wsClientCount = 0;
 
 const uint32_t SEND_INTERVAL_MS = 200;
 
@@ -42,7 +40,7 @@ static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_DATA;
 
 //———————— Function Prototypes ——————————
 void connectToWiFi();
-void onWsEvent(WStype_t type, uint8_t* payload, size_t length);
+void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
 
 float pixels1[MLX_COLS * MLX_ROWS];  // MLX90640 resolution
 
@@ -70,19 +68,18 @@ void setup() {
 
   connectToWiFi(); // connect to WiFi
 
-  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+  webSocket.begin();
   webSocket.onEvent(onWsEvent);
-  webSocket.setReconnectInterval(2000);
 
-  Serial.printf("WebSocket server started on port %d\n", WS_PORT);
+  Serial.printf("WebSocket server listening on port %d\n", WS_PORT);
 }
 
 void loop() {
-  // Always service websocket frequently; handshake + ping/pong depends on this.
+  // Always service websocket frequently.
   webSocket.loop();
 
-  // Don't do slow sensor reads or send data until the websocket is actually connected.
-  if (!wsConnected) {
+  // Don't do slow sensor reads or send data until at least one websocket client is connected.
+  if (wsClientCount == 0) {
     delay(10);
     return;
   }
@@ -114,7 +111,7 @@ void loop() {
     return;
   }
 
-  webSocket.sendBIN(buf, PACKET_BYTES);
+  webSocket.broadcastBIN(buf, PACKET_BYTES);
   delay(SEND_INTERVAL_MS);
 }
 
@@ -133,22 +130,22 @@ void connectToWiFi() {
   Serial.printf("IP address: %s\n", ip.toString().c_str());
 }
 
-void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
-      wsConnected = true;
-      Serial.printf("[WS] connected to %s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
+      wsClientCount++;
+      Serial.printf("[WS] client #%u connected (clients=%u)\n", num, wsClientCount);
       break;
 
     case WStype_DISCONNECTED:
-      wsConnected = false;
-      Serial.println("[WS] disconnected");
+      if (wsClientCount > 0) {
+        wsClientCount--;
+      }
+      Serial.printf("[WS] client #%u disconnected (clients=%u)\n", num, wsClientCount);
       break;
 
     case WStype_ERROR:
-      // payload content is library-dependent, but printing length helps.
-      wsConnected = false;
-      Serial.printf("[WS] error (len=%u)\n", (unsigned)length);
+      Serial.printf("[WS] error from client #%u (len=%u)\n", num, (unsigned)length);
       break;
 
     default:

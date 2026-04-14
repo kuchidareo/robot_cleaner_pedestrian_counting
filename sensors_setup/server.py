@@ -12,7 +12,7 @@ import websockets
 from annotation import AnnotationWriter
 
 
-HOST = "0.0.0.0"
+RECONNECT_DELAY_SECONDS = 2.0
 BASE_OUT_DIR = os.path.join(os.path.dirname(__file__), "out")
 FRAME_WIDTH = 32
 FRAME_HEIGHT = 24
@@ -32,9 +32,27 @@ PORTS = {
     "timercam4": 90,
 }
 
+# CHANGE HERE THE IP ADDRESSES OF THE DEVICES
+DEVICE_HOSTS = {
+    "main": "192.168.16.101",
+    "distance": "192.168.16.102",
+    "thermal2": "192.168.16.103",
+    "thermal3": "192.168.16.104",
+    "thermal4": "192.168.16.105",
+    "timercam1": "192.168.16.106",
+    "timercam2": "192.168.16.107",
+    "timercam3": "192.168.16.108",
+    "timercam4": "192.168.16.109",
+}
+
 THERMAL_NAMES = {"main", "thermal2", "thermal3", "thermal4"}
 THERMAL_ONLY_NAMES = {"thermal2", "thermal3", "thermal4"}
 TIMERCAM_NAMES = {"timercam1", "timercam2", "timercam3", "timercam4"}
+
+def websocket_url(name: str) -> str:
+    host = DEVICE_HOSTS[name]
+    port = PORTS[name]
+    return f"ws://{host}:{port}/"
 
 HDR = struct.Struct("<HH")
 DISTANCE_PACKET = struct.Struct("<f")
@@ -355,25 +373,32 @@ async def main() -> None:
     annotation_writer.start()
 
     sinks = make_csv_sinks(out_dir)
-    servers = []
 
-    for name, port in PORTS.items():
-        async def _handler(ws, *, _name=name):
-            await dispatch(ws, name=_name, sinks=sinks, out_dir=out_dir)
+    async def run_device(name: str) -> None:
+        while True:
+            url = websocket_url(name)
+            try:
+                print(f"Connecting: {name} -> {url}")
+                async with websockets.connect(url, ping_interval=None, max_size=None) as websocket:
+                    print(f"Connected: {name} -> {url}")
+                    await dispatch(websocket, name=name, sinks=sinks, out_dir=out_dir)
+            except Exception as exc:
+                print(f"[{name}] connection error: {exc}")
 
-        server = await websockets.serve(_handler, host=HOST, port=port, ping_interval=None)
-        servers.append(server)
-        print(f"Listening: {name} on ws://{HOST}:{port}/")
+            print(f"[{name}] reconnecting in {RECONNECT_DELAY_SECONDS:.1f}s")
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+
+    tasks = [asyncio.create_task(run_device(name)) for name in PORTS]
 
     try:
-        await asyncio.Future()
+        await asyncio.gather(*tasks)
     finally:
         annotation_writer.stop()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         for sink in sinks.values():
             sink.close()
-        for server in servers:
-            server.close()
-            await server.wait_closed()
 
 
 if __name__ == "__main__":

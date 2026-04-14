@@ -1,24 +1,22 @@
 #include <string.h>
 #include <M5TimerCAM.h>
 #include <WiFi.h>
-#include <WebSocketsClient.h>
+#include <WebSocketsServer.h>
 
 // Wi-Fi credentials
 static const char* WIFI_SSID     = "kalev-bitter-70";
 static const char* WIFI_PASSWORD = "shutakjp";
 
 // WebSocket server settings
-static const char* WS_HOST       = "192.168.121.188";
-static const char* WS_PATH       = "/";
 static const uint16_t WS_PORT    = 89;
 
 static const uint32_t SEND_INTERVAL_MS = 333;
 
-WebSocketsClient webSocket;
-static volatile bool wsConnected = false;
+WebSocketsServer webSocket(WS_PORT);
+static volatile uint8_t wsClientCount = 0;
 
 void connectToWiFi();
-void onWsEvent(WStype_t type, uint8_t* payload, size_t length);
+void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
 bool captureAndSendFrame();
 
 void setup() {
@@ -41,17 +39,16 @@ void setup() {
 
   connectToWiFi();
 
-  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+  webSocket.begin();
   webSocket.onEvent(onWsEvent);
-  webSocket.setReconnectInterval(2000);
 
-  Serial.printf("WebSocket client configured for ws://%s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
+  Serial.printf("WebSocket server listening on port %u\n", WS_PORT);
 }
 
 void loop() {
   webSocket.loop();
 
-  if (!wsConnected) {
+  if (wsClientCount == 0) {
     delay(10);
     return;
   }
@@ -76,23 +73,24 @@ void connectToWiFi() {
   Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
 }
 
-void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   (void)payload;
 
   switch (type) {
     case WStype_CONNECTED:
-      wsConnected = true;
-      Serial.printf("[WS] connected to %s:%u%s\n", WS_HOST, WS_PORT, WS_PATH);
+      wsClientCount++;
+      Serial.printf("[WS] client #%u connected (clients=%u)\n", num, wsClientCount);
       break;
 
     case WStype_DISCONNECTED:
-      wsConnected = false;
-      Serial.println("[WS] disconnected");
+      if (wsClientCount > 0) {
+        wsClientCount--;
+      }
+      Serial.printf("[WS] client #%u disconnected (clients=%u)\n", num, wsClientCount);
       break;
 
     case WStype_ERROR:
-      wsConnected = false;
-      Serial.printf("[WS] error (len=%u)\n", (unsigned)length);
+      Serial.printf("[WS] error from client #%u (len=%u)\n", num, (unsigned)length);
       break;
 
     default:
@@ -107,7 +105,7 @@ bool captureAndSendFrame() {
   }
 
   TimerCAM.Power.setLed(255);
-  webSocket.sendBIN(TimerCAM.Camera.fb->buf, TimerCAM.Camera.fb->len);
+  webSocket.broadcastBIN(TimerCAM.Camera.fb->buf, TimerCAM.Camera.fb->len);
   Serial.printf("Sent JPEG frame: %u bytes\n", (unsigned)TimerCAM.Camera.fb->len);
   TimerCAM.Camera.free();
   TimerCAM.Power.setLed(0);
