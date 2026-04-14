@@ -46,7 +46,7 @@ float pixels1[MLX_COLS * MLX_ROWS];  // MLX90640 resolution
 
 void setup() {
   M5.begin();
-  Wire.begin(0, 26);  // SDA = GPIO0, SCL = GPIO26 for Thermal Hat
+  Wire.begin(32, 33);
   Serial.begin(115200);
   esp_log_level_set("wifi", ESP_LOG_NONE);
   delay(1000);
