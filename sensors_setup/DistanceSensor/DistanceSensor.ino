@@ -2,17 +2,15 @@
 #include <Unit_Sonic.h>
 #include <M5StickCPlus.h>
 #include <WiFi.h>
-#include <WebSocketsClient.h>
+#include <WebSocketsServer.h>
 
 // === WiFi ===
 const char* WIFI_SSID     = "kalev-bitter-70";
 const char* WIFI_PASSWORD = "shutakjp";
 
-// === WebSocket destination (receiver) ===
-const char* WS_HOST = "192.168.121.188";
-const char* WS_PATH = "/";
+// === WebSocket server settings ===
 const uint16_t WS_PORT = 82;
-WebSocketsClient webSocket;
+WebSocketsServer webSocket(WS_PORT);
 
 // === Timing ===
 const uint32_t SEND_INTERVAL_MS = 200;
@@ -23,11 +21,13 @@ SONIC_I2C sonar;
 // === State ===
 float distanceCm = 0.0f;
 
+static volatile uint8_t wsClientCount = 0;
+
 void connectToWiFi();
 void readDistance();
 void updateDisplay();
 void sendDistance();
-void onWsEvent(WStype_t type, uint8_t* payload, size_t length);
+void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
 
 void setup() {
   Serial.begin(115200);
@@ -46,9 +46,8 @@ void setup() {
   // WiFi
   connectToWiFi();
 
-  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+  webSocket.begin();
   webSocket.onEvent(onWsEvent);
-  webSocket.setReconnectInterval(2000);
 
   // Optional: Disable internal pull-up/pull-down on GPIO25 if needed
   gpio_pulldown_dis(GPIO_NUM_25);
@@ -114,26 +113,30 @@ void updateDisplay() {
 }
 
 void sendDistance() {
-  if (!webSocket.isConnected()) {
-    Serial.println("WS not connected, skipping send");
+  if (wsClientCount == 0) {
+    Serial.println("No WS client connected, skipping send");
     return;
   }
   uint8_t buf[sizeof(distanceCm)];
   memcpy(buf, &distanceCm, sizeof(distanceCm));
-  webSocket.sendBIN(buf, sizeof(distanceCm));
+  webSocket.broadcastBIN(buf, sizeof(distanceCm));
   Serial.println("WS sent");
 }
 
-void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
-      Serial.println("WS connected");
+      wsClientCount++;
+      Serial.printf("[WS] client #%u connected (clients=%u)\n", num, wsClientCount);
       break;
     case WStype_DISCONNECTED:
-      Serial.println("WS disconnected");
+      if (wsClientCount > 0) {
+        wsClientCount--;
+      }
+      Serial.printf("[WS] client #%u disconnected (clients=%u)\n", num, wsClientCount);
       break;
     case WStype_ERROR:
-      Serial.println("WS error");
+      Serial.printf("[WS] error from client #%u\n", num);
       break;
     default:
       break;
