@@ -104,7 +104,7 @@ async def discover_host_for_port(name: str, port: int, subnet_prefix: str) -> st
 
 async def discover_device_hosts() -> Dict[str, str]:
     subnet_prefix = local_subnet_prefix()
-    print(f"Discovering devices on {subnet_prefix}.0/24")
+    # print(f"Discovering devices on {subnet_prefix}.0/24")
 
     hosts: Dict[str, str] = {}
     for name, port in PORTS.items():
@@ -112,7 +112,7 @@ async def discover_device_hosts() -> Dict[str, str]:
         if host is None:
             continue
         hosts[name] = host
-        print(f"Discovered: {name} -> {host}:{port}")
+        # print(f"Discovered: {name} -> {host}:{port}")
 
     return hosts
 
@@ -235,8 +235,8 @@ async def handle_main(websocket, sinks: Dict[str, CsvSink]) -> None:
     window_count = 0
     window_started_at = time.monotonic()
     peer = getattr(websocket, "remote_address", None)
-    print(f"[main] connected from {peer}")
-    print(f"[main] expecting {BYTES_MAIN_PACKET} bytes")
+    # print(f"[main] connected from {peer}")
+    # print(f"[main] expecting {BYTES_MAIN_PACKET} bytes")
 
     async for payload in websocket:
         if isinstance(payload, str):
@@ -288,7 +288,7 @@ async def handle_distance(websocket, sink: CsvSink) -> None:
     window_count = 0
     window_started_at = time.monotonic()
     peer = getattr(websocket, "remote_address", None)
-    print(f"[distance] connected from {peer}")
+    # print(f"[distance] connected from {peer}")
 
     async for payload in websocket:
         if isinstance(payload, str):
@@ -318,8 +318,8 @@ async def handle_thermal(websocket, name: str, sink: CsvSink) -> None:
     window_count = 0
     window_started_at = time.monotonic()
     peer = getattr(websocket, "remote_address", None)
-    print(f"[{name}] connected from {peer}")
-    print(f"[{name}] expecting {BYTES_THERMAL_PACKET} bytes")
+    # print(f"[{name}] connected from {peer}")
+    # print(f"[{name}] expecting {BYTES_THERMAL_PACKET} bytes")
 
     async for payload in websocket:
         if isinstance(payload, str):
@@ -352,7 +352,7 @@ async def handle_timercam(websocket, name: str, csv_sink: CsvSink, image_dir: st
     window_count = 0
     window_started_at = time.monotonic()
     peer = getattr(websocket, "remote_address", None)
-    print(f"[{name}] connected from {peer}")
+    # print(f"[{name}] connected from {peer}")
 
     async for payload in websocket:
         if isinstance(payload, str):
@@ -444,9 +444,9 @@ async def main() -> None:
             host = device_hosts[name]
             url = websocket_url(name, host)
             try:
-                print(f"Connecting: {name} -> {url}")
+                # print(f"Connecting: {name} -> {url}")
                 async with websockets.connect(url, ping_interval=None, max_size=None) as websocket:
-                    print(f"Connected: {name} -> {url}")
+                    # print(f"Connected: {name} -> {url}")
                     await dispatch(websocket, name=name, sinks=sinks, out_dir=out_dir)
             except Exception as exc:
                 print(f"[{name}] connection error: {exc}")
