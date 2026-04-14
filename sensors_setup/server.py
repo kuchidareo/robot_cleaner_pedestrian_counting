@@ -5,6 +5,7 @@ import struct
 import time
 from dataclasses import dataclass
 from typing import Dict
+import socket
 
 import numpy as np
 import websockets
@@ -32,27 +33,88 @@ PORTS = {
     "timercam4": 90,
 }
 
-# CHANGE HERE THE IP ADDRESSES OF THE DEVICES
-DEVICE_HOSTS = {
-    "main": "192.168.16.101",
-    "distance": "192.168.16.102",
-    "thermal2": "192.168.16.103",
-    "thermal3": "192.168.16.104",
-    "thermal4": "192.168.16.105",
-    "timercam1": "192.168.16.106",
-    "timercam2": "192.168.16.107",
-    "timercam3": "192.168.16.108",
-    "timercam4": "192.168.16.109",
-}
+DISCOVERY_TIMEOUT_SECONDS = 0.25
+DISCOVERY_CONCURRENCY = 64
 
 THERMAL_NAMES = {"main", "thermal2", "thermal3", "thermal4"}
 THERMAL_ONLY_NAMES = {"thermal2", "thermal3", "thermal4"}
 TIMERCAM_NAMES = {"timercam1", "timercam2", "timercam3", "timercam4"}
 
-def websocket_url(name: str) -> str:
-    host = DEVICE_HOSTS[name]
+def websocket_url(name: str, host: str) -> str:
     port = PORTS[name]
     return f"ws://{host}:{port}/"
+
+
+def local_ipv4_address() -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    finally:
+        sock.close()
+
+
+def local_subnet_prefix() -> str:
+    ip = local_ipv4_address()
+    parts = ip.split(".")
+    if len(parts) != 4:
+        raise RuntimeError(f"unexpected local IPv4 address: {ip}")
+    return ".".join(parts[:3])
+
+
+async def tcp_port_open(host: str, port: int, timeout: float = DISCOVERY_TIMEOUT_SECONDS) -> bool:
+    try:
+        connect_coro = asyncio.open_connection(host, port)
+        reader, writer = await asyncio.wait_for(connect_coro, timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
+
+
+async def discover_host_for_port(name: str, port: int, subnet_prefix: str) -> str | None:
+    semaphore = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
+    found_host: str | None = None
+
+    async def probe(host: str) -> str | None:
+        nonlocal found_host
+        async with semaphore:
+            if found_host is not None:
+                return None
+            if await tcp_port_open(host, port):
+                found_host = host
+                return host
+            return None
+
+    tasks = [asyncio.create_task(probe(f"{subnet_prefix}.{i}")) for i in range(1, 255)]
+    try:
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            if result is not None:
+                return result
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    print(f"Skipping undiscovered device: {name} (port {port})")
+    return None
+
+
+async def discover_device_hosts() -> Dict[str, str]:
+    subnet_prefix = local_subnet_prefix()
+    print(f"Discovering devices on {subnet_prefix}.0/24")
+
+    hosts: Dict[str, str] = {}
+    for name, port in PORTS.items():
+        host = await discover_host_for_port(name, port, subnet_prefix)
+        if host is None:
+            continue
+        hosts[name] = host
+        print(f"Discovered: {name} -> {host}:{port}")
+
+    return hosts
 
 HDR = struct.Struct("<HH")
 DISTANCE_PACKET = struct.Struct("<f")
@@ -373,10 +435,14 @@ async def main() -> None:
     annotation_writer.start()
 
     sinks = make_csv_sinks(out_dir)
+    device_hosts = await discover_device_hosts()
+    if not device_hosts:
+        raise RuntimeError("No devices discovered on the current subnet")
 
     async def run_device(name: str) -> None:
         while True:
-            url = websocket_url(name)
+            host = device_hosts[name]
+            url = websocket_url(name, host)
             try:
                 print(f"Connecting: {name} -> {url}")
                 async with websockets.connect(url, ping_interval=None, max_size=None) as websocket:
@@ -388,7 +454,7 @@ async def main() -> None:
             print(f"[{name}] reconnecting in {RECONNECT_DELAY_SECONDS:.1f}s")
             await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
-    tasks = [asyncio.create_task(run_device(name)) for name in PORTS]
+    tasks = [asyncio.create_task(run_device(name)) for name in device_hosts]
 
     try:
         await asyncio.gather(*tasks)
