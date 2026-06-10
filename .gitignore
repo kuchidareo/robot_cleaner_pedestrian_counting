@@ -1,4 +1,8 @@
 *.csv
 *.DS_Store
 venv
+.venv-map/
 *__pycache__
+*.zlib.enc
+*.mp4
+.cache/

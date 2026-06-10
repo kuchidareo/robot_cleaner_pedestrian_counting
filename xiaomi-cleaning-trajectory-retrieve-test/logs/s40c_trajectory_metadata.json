@@ -1,0 +1,12 @@
+{
+  "model": "xiaomi.vacuum.e101gb",
+  "map_width": 205,
+  "map_height": 211,
+  "trajectory_segments": 1,
+  "trajectory_points": 1100,
+  "vacuum_position": {
+    "x": -16,
+    "y": -310,
+    "a": 47.11
+  }
+}
