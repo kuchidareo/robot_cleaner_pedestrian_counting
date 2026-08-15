@@ -102,6 +102,7 @@ async def discover_single_device(name: str) -> str:
         subnet_prefix = local_subnet_prefix()
         host = await discover_host_for_port(name, port, subnet_prefix)
         if host is not None:
+            print(f"[{name}] discovered {host}:{port}")
             return host
         print(f"[{name}] discovery retry in {DISCOVERY_RETRY_DELAY_SECONDS:.1f}s")
         await asyncio.sleep(DISCOVERY_RETRY_DELAY_SECONDS)
@@ -331,9 +332,9 @@ async def main() -> None:
             host = await discover_single_device(name)
             url = websocket_url(name, host)
             try:
-                # print(f"[{name}] connecting to {url}")
+                print(f"[{name}] connecting to {url}")
                 async with websockets.connect(url, ping_interval=None, max_size=None) as websocket:
-                    # print(f"[{name}] connected to {url}")
+                    print(f"[{name}] connected to {url}")
                     await dispatch(websocket, name=name, sinks=sinks)
             except Exception as exc:
                 print(f"[{name}] connection error: {exc}")
