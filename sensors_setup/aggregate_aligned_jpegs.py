@@ -2,128 +2,166 @@ from __future__ import annotations
 
 import argparse
 import csv
-import io
-import os
 import statistics
-import tempfile
 from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-import matplotlib
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from transform_thermalarray import frame_to_rgb, iter_frames
 
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-
 THERMAL_PIXEL_SIZE = 20
 PANEL_WIDTH = 640
 PANEL_HEIGHT = 480
 CANVAS_WIDTH = PANEL_WIDTH * 2
-CANVAS_HEIGHT = 1280
-INFO_HEIGHT = 170
-PLOTS_HEIGHT = CANVAS_HEIGHT - PANEL_HEIGHT - INFO_HEIGHT
+CANVAS_HEIGHT = PANEL_HEIGHT * 2 + 90
 DEFAULT_RUN_DIR = Path("out/20260330_1434")
-DEFAULT_OUTPUT_DIR = DEFAULT_RUN_DIR / "aligned_aggregate_jpegs"
-HISTORY_POINTS = 50
-PLOT_DPI = 140
-PLOT_BG = "#ffffff"
+DEFAULT_OUTPUT_DIR_NAME = "aligned_aggregate_jpegs"
+DEFAULT_MAX_MATCH_DELTA = 1.0
 
+THERMAL_CAMERAS = (
+    ("main", "Thermal 1 (Front)", ("main.csv", "thermal_main.csv")),
+    ("thermal2", "Thermal 2 (Back)", ("thermal2.csv", "thermal_cam2.csv")),
+    ("thermal3", "Thermal 3 (Right)", ("thermal3.csv", "thermal_cam3.csv")),
+    ("thermal4", "Thermal 4 (Left)", ("thermal4.csv", "thermal_cam4.csv")),
+)
 
 @dataclass(frozen=True)
-class TimedRow:
+class TimedFrame:
     timestamp: float
-    row: dict[str, Any]
+    frame: np.ndarray
 
 
 @dataclass(frozen=True)
-class SensorSeries:
-    rows: list[TimedRow]
+class ThermalSeries:
+    frames: list[TimedFrame]
     timestamps: list[float]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Render aligned aggregate JPEGs with matplotlib trend plots."
-    )
+    parser = argparse.ArgumentParser(description="Render four timestamp-aligned thermal arrays as JPEG files.")
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Defaults to <run-dir>/aligned_aggregate_jpegs.",
+    )
+    parser.add_argument(
+        "--max-match-delta",
+        type=float,
+        default=DEFAULT_MAX_MATCH_DELTA,
+        help=f"Maximum nearest-frame time difference in seconds. Default: {DEFAULT_MAX_MATCH_DELTA:.1f}.",
+    )
     parser.add_argument("--annotation-tolerance", type=float, default=None)
     parser.add_argument("--limit", type=int, default=None)
     return parser.parse_args()
 
 
-def make_series(rows: list[TimedRow]) -> SensorSeries:
-    return SensorSeries(rows=rows, timestamps=[row.timestamp for row in rows])
+def empty_series() -> ThermalSeries:
+    return ThermalSeries(frames=[], timestamps=[])
 
 
-def load_csv_rows(csv_path: Path) -> SensorSeries:
-    with csv_path.open(newline="") as handle:
-        reader = csv.DictReader(handle)
-        rows = [TimedRow(timestamp=float(row["timestamp"]), row=row) for row in reader]
-    return make_series(rows)
+def first_existing(run_dir: Path, candidates: tuple[str, ...]) -> Path:
+    for filename in candidates:
+        path = run_dir / filename
+        if path.exists():
+            return path
+    return run_dir / candidates[0]
 
 
-def load_thermal_rows(csv_path: Path) -> SensorSeries:
-    rows: list[TimedRow] = []
-    for _, timestamp, frame in iter_frames(csv_path):
-        rows.append(TimedRow(timestamp=float(timestamp), row={"frame": frame}))
-    return make_series(rows)
+def load_thermal_series(csv_path: Path, label: str) -> ThermalSeries:
+    if not csv_path.exists():
+        print(f"warning: {label} missing: {csv_path}")
+        return empty_series()
+
+    try:
+        frames = [
+            TimedFrame(timestamp=float(timestamp), frame=frame)
+            for _, timestamp, frame in iter_frames(csv_path)
+        ]
+    except (OSError, ValueError) as exc:
+        print(f"warning: {label} could not be loaded from {csv_path}: {exc}")
+        return empty_series()
+
+    frames.sort(key=lambda item: item.timestamp)
+    if not frames:
+        print(f"warning: {label} contains no frames: {csv_path}")
+    return ThermalSeries(frames=frames, timestamps=[item.timestamp for item in frames])
 
 
-def estimate_fps(series: SensorSeries) -> float:
-    if len(series.rows) < 2:
+def estimate_fps(series: ThermalSeries) -> float:
+    if len(series.frames) < 2:
         return 0.0
-    duration = series.rows[-1].timestamp - series.rows[0].timestamp
-    return (len(series.rows) - 1) / duration if duration > 0 else 0.0
+    duration = series.frames[-1].timestamp - series.frames[0].timestamp
+    return (len(series.frames) - 1) / duration if duration > 0 else 0.0
 
 
-def median_interval(series: SensorSeries) -> float:
-    if len(series.rows) < 2:
+def median_interval(series: ThermalSeries) -> float:
+    if len(series.frames) < 2:
         return 0.0
-    deltas = [series.rows[i + 1].timestamp - series.rows[i].timestamp for i in range(len(series.rows) - 1)]
-    return statistics.median(deltas)
+    return statistics.median(
+        series.timestamps[index + 1] - series.timestamps[index]
+        for index in range(len(series.timestamps) - 1)
+    )
+
+def nearest_frame(series: ThermalSeries, target_ts: float) -> tuple[TimedFrame | None, float | None]:
+    if not series.frames:
+        return None, None
+
+    position = bisect_left(series.timestamps, target_ts)
+    candidates: list[TimedFrame] = []
+    if position < len(series.frames):
+        candidates.append(series.frames[position])
+    if position > 0:
+        candidates.append(series.frames[position - 1])
+
+    frame = min(candidates, key=lambda item: abs(item.timestamp - target_ts))
+    return frame, abs(frame.timestamp - target_ts)
 
 
-def nearest_row(series: SensorSeries, target_ts: float) -> tuple[TimedRow, float]:
-    pos = bisect_left(series.timestamps, target_ts)
-    candidates: list[TimedRow] = []
-    if pos < len(series.rows):
-        candidates.append(series.rows[pos])
-    if pos > 0:
-        candidates.append(series.rows[pos - 1])
-    best = min(candidates, key=lambda row: abs(row.timestamp - target_ts))
-    return best, abs(best.timestamp - target_ts)
+def load_annotations(csv_path: Path) -> tuple[list[float], list[bool]]:
+    if not csv_path.exists():
+        return [], []
+
+    timestamps: list[float] = []
+    values: list[bool] = []
+    try:
+        with csv_path.open(newline="") as handle:
+            for row in csv.DictReader(handle):
+                timestamp = row.get("timestamp")
+                if not timestamp:
+                    continue
+                timestamps.append(float(timestamp))
+                values.append(str(row.get("annotation", "")).strip().lower() == "true")
+    except (OSError, ValueError) as exc:
+        print(f"warning: annotation could not be loaded from {csv_path}: {exc}")
+        return [], []
+
+    ordered = sorted(zip(timestamps, values), key=lambda item: item[0])
+    return [item[0] for item in ordered], [item[1] for item in ordered]
 
 
-def latest_history(series: SensorSeries, target_ts: float, count: int = HISTORY_POINTS) -> list[TimedRow]:
-    if not series.rows:
-        return []
-    pos = bisect_left(series.timestamps, target_ts)
-    end = pos + 1 if pos < len(series.rows) and series.timestamps[pos] <= target_ts else pos
-    if end <= 0:
-        end = 1
-    start = max(0, end - count)
-    return series.rows[start:end]
+def annotation_at(
+    timestamps: list[float],
+    values: list[bool],
+    target_ts: float,
+    tolerance: float,
+) -> bool:
+    if not timestamps:
+        return False
 
-
-def annotation_value(annotation_series: SensorSeries, target_ts: float, tolerance: float) -> tuple[bool, float | None]:
-    if not annotation_series.rows:
-        return False, None
-    row, delta = nearest_row(annotation_series, target_ts)
-    if delta <= tolerance:
-        return row.row["annotation"].strip().lower() == "true", delta
-    return False, None
+    position = bisect_left(timestamps, target_ts)
+    candidates = [index for index in (position - 1, position) if 0 <= index < len(timestamps)]
+    nearest_index = min(candidates, key=lambda index: abs(timestamps[index] - target_ts))
+    return abs(timestamps[nearest_index] - target_ts) <= tolerance and values[nearest_index]
 
 
 def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    for name in ("Menlo.ttc", "Menlo.ttc", "Arial Unicode.ttf", "Helvetica.ttc"):
+    for name in ("DejaVuSans.ttf", "Arial.ttf", "Helvetica.ttc"):
         try:
             return ImageFont.truetype(name, size=size)
         except OSError:
@@ -131,267 +169,135 @@ def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def fmt_time(ts: float) -> str:
-    whole = int(ts)
-    frac = int(round((ts - whole) * 10))
-    hours = (whole // 3600) % 24
-    minutes = (whole // 60) % 60
-    seconds = whole % 60
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{frac}"
-
-
-def history_values(history: list[TimedRow], key: str) -> tuple[list[float], list[str]]:
-    return [float(row.row[key]) for row in history], [fmt_time(row.timestamp) for row in history]
-
-
-def make_plot_image(
-    *,
-    title: str,
-    values: list[float],
-    labels: list[str],
-    width: int,
-    height: int,
-    color: str,
-) -> Image.Image:
-    fig_w = width / PLOT_DPI
-    fig_h = height / PLOT_DPI
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=PLOT_DPI)
-    fig.patch.set_facecolor(PLOT_BG)
-    ax.set_facecolor(PLOT_BG)
-
-    if values:
-        x = np.arange(len(values))
-        ax.plot(x, values, color=color, linewidth=2.4, marker="o", markersize=3.2)
-        ax.scatter([x[-1]], [values[-1]], color=color, s=44, zorder=3)
-        tick_count = min(6, len(values))
-        tick_positions = np.linspace(0, len(values) - 1, tick_count, dtype=int)
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels([labels[i] for i in tick_positions], rotation=0, fontsize=8)
-    else:
-        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    ax.set_title(title, fontsize=14, loc="left", pad=10)
-    ax.grid(True, color="#e8e8e8", linewidth=0.8)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-    ax.tick_params(axis="y", labelsize=9)
-    plt.tight_layout()
-
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    buffer.seek(0)
-    return Image.open(buffer).convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
-
-
-def build_info_panel(lines: list[str]) -> Image.Image:
-    image = Image.new("RGB", (CANVAS_WIDTH, INFO_HEIGHT), "#f7f7f7")
-    draw = ImageDraw.Draw(image)
-    body_font = load_font(20)
-    draw.line((20, INFO_HEIGHT - 1, CANVAS_WIDTH - 20, INFO_HEIGHT - 1), fill="#d8d8d8", width=1)
-    y = 10
-    for line in lines:
-        draw.text((20, y), line, fill="#111111", font=body_font)
-        y += 26
-    return image
-
-
-def build_plots_panel(
-    *,
-    distance_values: list[float],
-    distance_labels: list[str],
-    motion_values: list[float],
-    motion_labels: list[str],
-    presence_values: list[float],
-    presence_labels: list[str],
-    ambient_values: list[float],
-    ambient_labels: list[str],
-) -> Image.Image:
-    panel = Image.new("RGB", (CANVAS_WIDTH, PLOTS_HEIGHT), "#f7f7f7")
-    margin = 20
-    gap = 20
-    height = (PLOTS_HEIGHT - gap - margin * 2) // 2
-    col_w = (CANVAS_WIDTH - margin * 2 - gap * 2) // 3
-
-    distance_plot = make_plot_image(
-        title="Distance History",
-        values=distance_values,
-        labels=distance_labels,
-        width=col_w,
-        height=height,
-        color="#2563eb",
-    )
-    motion_plot = make_plot_image(
-        title="PIR Motion History",
-        values=motion_values,
-        labels=motion_labels,
-        width=col_w,
-        height=height,
-        color="#dc2626",
-    )
-    presence_plot = make_plot_image(
-        title="Presence History",
-        values=presence_values,
-        labels=presence_labels,
-        width=col_w,
-        height=height,
-        color="#16a34a",
-    )
-    ambient_plot = make_plot_image(
-        title="Ambient History",
-        values=ambient_values,
-        labels=ambient_labels,
-        width=col_w,
-        height=height,
-        color="#d97706",
-    )
-
-    panel.paste(distance_plot, (margin, 10))
-    panel.paste(motion_plot, (margin, height + gap))
-    panel.paste(presence_plot, (margin + col_w + gap, height + gap))
-    panel.paste(ambient_plot, (margin + (col_w + gap) * 2, height + gap))
+def placeholder_panel(title: str, reason: str) -> Image.Image:
+    panel = Image.new("RGB", (PANEL_WIDTH, PANEL_HEIGHT), "black")
+    draw = ImageDraw.Draw(panel)
+    draw.text((16, 14), title, fill="white", font=load_font(24))
+    draw.text((16, 50), reason, fill="#aaaaaa", font=load_font(18))
     return panel
 
 
-def build_top_panel(timercam_path: Path, thermal_rgb: np.ndarray) -> Image.Image:
-    left = Image.open(timercam_path).convert("RGB").resize((PANEL_WIDTH, PANEL_HEIGHT), Image.Resampling.LANCZOS)
-    right = Image.fromarray(thermal_rgb, mode="RGB").resize(
-        (PANEL_WIDTH, PANEL_HEIGHT), Image.Resampling.NEAREST
+def render_thermal_panel(
+    title: str,
+    series: ThermalSeries,
+    target_ts: float,
+    max_match_delta: float,
+) -> Image.Image:
+    timed_frame, delta = nearest_frame(series, target_ts)
+    if timed_frame is None:
+        return placeholder_panel(title, "Missing thermal data")
+    if delta is None or delta > max_match_delta:
+        return placeholder_panel(title, f"No frame within {max_match_delta:.1f}s")
+
+    frame = np.asarray(timed_frame.frame, dtype=np.float32)
+    finite_values = frame[np.isfinite(frame)]
+    if finite_values.size == 0:
+        return placeholder_panel(title, "Invalid thermal frame")
+
+    frame = np.where(np.isfinite(frame), frame, float(np.median(finite_values)))
+    panel = Image.fromarray(frame_to_rgb(frame, THERMAL_PIXEL_SIZE)).convert("RGB")
+    panel = panel.resize((PANEL_WIDTH, PANEL_HEIGHT), Image.Resampling.NEAREST)
+
+    draw = ImageDraw.Draw(panel)
+    draw.rectangle((0, 0, PANEL_WIDTH, 62), fill="black")
+    draw.text((12, 6), title, fill="white", font=load_font(22))
+    draw.text(
+        (12, 34),
+        f"dt={delta:.3f}s  min={float(np.min(finite_values)):.2f}C  max={float(np.max(finite_values)):.2f}C",
+        fill="#dddddd",
+        font=load_font(16),
     )
-    top = Image.new("RGB", (CANVAS_WIDTH, PANEL_HEIGHT), "white")
-    top.paste(left, (0, 0))
-    top.paste(right, (PANEL_WIDTH, 0))
-    return top
-
-
-def format_info_lines(
-    *,
-    base_name: str,
-    base_ts: float,
-    thermal_row: TimedRow,
-    distance_row: TimedRow,
-    pir_row: TimedRow,
-    annotation_flag: bool,
-    annotation_delta: float | None,
-    deltas: dict[str, float],
-) -> list[str]:
-    annotation_text = "True" if annotation_flag else "False"
-    annotation_delta_text = "n/a" if annotation_delta is None else f"{annotation_delta:.3f}s"
-    return [
-        f"Base sensor: {base_name}   timestamp: {base_ts:.6f}",
-        f"Thermal ts: {thermal_row.timestamp:.6f}   dt: {deltas['thermal']:.3f}s",
-        f"Distance: {distance_row.row['distance_cm']} cm   ts: {distance_row.timestamp:.6f}   dt: {deltas['distance']:.3f}s",
-        f"PIR ts: {pir_row.timestamp:.6f}   dt: {deltas['pir']:.3f}s   motion: {pir_row.row['motion']}   presence: {pir_row.row['presence']}   ambient: {pir_row.row['ambient']}",
-        f"Annotation: {annotation_text}   match_dt: {annotation_delta_text}",
-    ]
+    return panel
 
 
 def compose_frame(
-    *,
-    timercam_path: Path,
-    thermal_rgb: np.ndarray,
-    info_lines: list[str],
-    distance_values: list[float],
-    distance_labels: list[str],
-    motion_values: list[float],
-    motion_labels: list[str],
-    presence_values: list[float],
-    presence_labels: list[str],
-    ambient_values: list[float],
-    ambient_labels: list[str],
+    thermal_series: dict[str, ThermalSeries],
+    base_name: str,
+    base_ts: float,
+    max_match_delta: float,
+    annotation: bool,
 ) -> Image.Image:
-    canvas = Image.new("RGB", (CANVAS_WIDTH, CANVAS_HEIGHT), "#f7f7f7")
-    canvas.paste(build_top_panel(timercam_path, thermal_rgb), (0, 0))
-    canvas.paste(build_info_panel(info_lines), (0, PANEL_HEIGHT))
-    canvas.paste(
-        build_plots_panel(
-            distance_values=distance_values,
-            distance_labels=distance_labels,
-            motion_values=motion_values,
-            motion_labels=motion_labels,
-            presence_values=presence_values,
-            presence_labels=presence_labels,
-            ambient_values=ambient_values,
-            ambient_labels=ambient_labels,
-        ),
-        (0, PANEL_HEIGHT + INFO_HEIGHT),
+    canvas = Image.new("RGB", (CANVAS_WIDTH, CANVAS_HEIGHT), "black")
+
+    for index, (name, label, _) in enumerate(THERMAL_CAMERAS):
+        panel = render_thermal_panel(label, thermal_series[name], base_ts, max_match_delta)
+        x = (index % 2) * PANEL_WIDTH
+        y = (index // 2) * PANEL_HEIGHT
+        canvas.paste(panel, (x, y))
+
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((0, PANEL_HEIGHT * 2, CANVAS_WIDTH, CANVAS_HEIGHT), fill="#111111")
+    draw.text(
+        (16, PANEL_HEIGHT * 2 + 12),
+        f"Base: {base_name}    timestamp: {base_ts:.6f}    annotation: {annotation}",
+        fill="white",
+        font=load_font(22),
     )
     return canvas
 
 
+def pick_base_series(series_by_name: dict[str, ThermalSeries]) -> tuple[str, ThermalSeries]:
+    available = {name: series for name, series in series_by_name.items() if series.frames}
+    if not available:
+        raise ValueError("no thermal frames found in the run directory")
+
+    measured_fps = {name: estimate_fps(series) for name, series in available.items()}
+    positive_fps = {name: fps for name, fps in measured_fps.items() if fps > 0}
+    if positive_fps:
+        base_name = min(positive_fps, key=positive_fps.get)
+    else:
+        base_name = min(available, key=lambda name: len(available[name].frames))
+    return base_name, available[base_name]
+
+
 def main() -> None:
     args = parse_args()
+    if args.max_match_delta < 0:
+        raise ValueError("--max-match-delta must be non-negative")
+    if args.limit is not None and args.limit < 0:
+        raise ValueError("--limit must be non-negative")
+
     run_dir = args.run_dir.resolve()
-    output_dir = args.output_dir.resolve()
+    output_dir = (args.output_dir or run_dir / DEFAULT_OUTPUT_DIR_NAME).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    sensor_series = {
-        "timercam1": load_csv_rows(run_dir / "timercam1.csv"),
-        "main": load_thermal_rows(run_dir / "main.csv"),
-        "distance": load_csv_rows(run_dir / "distance.csv"),
-        "main_pir": load_csv_rows(run_dir / "main_pir.csv"),
+    thermal_series = {
+        name: load_thermal_series(first_existing(run_dir, candidates), label)
+        for name, label, candidates in THERMAL_CAMERAS
     }
-    annotation_series = load_csv_rows(run_dir / "annotation.csv")
-
-    fps_by_sensor = {name: estimate_fps(series) for name, series in sensor_series.items()}
-    base_name = min(fps_by_sensor, key=fps_by_sensor.get)
-    base_series = sensor_series[base_name]
+    annotation_timestamps, annotation_values = load_annotations(run_dir / "annotation.csv")
+    base_name, base_series = pick_base_series(thermal_series)
     annotation_tolerance = (
         args.annotation_tolerance
         if args.annotation_tolerance is not None
         else max(0.25, median_interval(base_series) / 2.0)
     )
 
-    print("Sensor FPS:")
-    for name, fps in fps_by_sensor.items():
-        print(f"  {name}: {fps:.3f}")
-    print(f"Base sensor: {base_name}")
-    print(f"Annotation tolerance: {annotation_tolerance:.3f}s")
+    print("Thermal streams:")
+    for name, series in thermal_series.items():
+        print(f"  {name}: {len(series.frames)} frames, {estimate_fps(series):.3f} FPS")
+    print(f"Base stream: {base_name}")
+    print(f"Maximum match delta: {args.max_match_delta:.3f}s")
 
-    thermal_series = sensor_series["main"]
-    distance_series = sensor_series["distance"]
-    pir_series = sensor_series["main_pir"]
-    frame_total = len(base_series.rows) if args.limit is None else min(len(base_series.rows), args.limit)
+    frame_total = len(base_series.frames)
+    if args.limit is not None:
+        frame_total = min(frame_total, args.limit)
 
-    for index, base_row in enumerate(base_series.rows[:frame_total], start=1):
-        base_ts = base_row.timestamp
-        thermal_row, thermal_delta = nearest_row(thermal_series, base_ts)
-        distance_row, distance_delta = nearest_row(distance_series, base_ts)
-        pir_row, pir_delta = nearest_row(pir_series, base_ts)
-        annotation_flag, annotation_delta = annotation_value(annotation_series, base_ts, annotation_tolerance)
-
-        distance_history = latest_history(distance_series, distance_row.timestamp)
-        pir_history = latest_history(pir_series, pir_row.timestamp)
-        distance_values, distance_labels = history_values(distance_history, "distance_cm")
-        motion_values, motion_labels = history_values(pir_history, "motion")
-        presence_values, presence_labels = history_values(pir_history, "presence")
-        ambient_values, ambient_labels = history_values(pir_history, "ambient")
-
+    for index, base_frame in enumerate(base_series.frames[:frame_total], start=1):
+        timestamp = base_frame.timestamp
         image = compose_frame(
-            timercam_path=run_dir / "timercam1" / base_row.row["filename"],
-            thermal_rgb=frame_to_rgb(thermal_row.row["frame"], THERMAL_PIXEL_SIZE),
-            info_lines=format_info_lines(
-                base_name=base_name,
-                base_ts=base_ts,
-                thermal_row=thermal_row,
-                distance_row=distance_row,
-                pir_row=pir_row,
-                annotation_flag=annotation_flag,
-                annotation_delta=annotation_delta,
-                deltas={"thermal": thermal_delta, "distance": distance_delta, "pir": pir_delta},
+            thermal_series=thermal_series,
+            base_name=base_name,
+            base_ts=timestamp,
+            max_match_delta=args.max_match_delta,
+            annotation=annotation_at(
+                annotation_timestamps,
+                annotation_values,
+                timestamp,
+                annotation_tolerance,
             ),
-            distance_values=distance_values,
-            distance_labels=distance_labels,
-            motion_values=motion_values,
-            motion_labels=motion_labels,
-            presence_values=presence_values,
-            presence_labels=presence_labels,
-            ambient_values=ambient_values,
-            ambient_labels=ambient_labels,
         )
-        image.save(output_dir / f"aggregate_{index:04d}_{base_ts:.6f}.jpg", format="JPEG", quality=95)
+        image.save(output_dir / f"aggregate_{index:04d}_{timestamp:.6f}.jpg", quality=95)
 
     print(f"saved {frame_total} aggregate JPEG files to {output_dir}")
 

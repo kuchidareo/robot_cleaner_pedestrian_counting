@@ -1,0 +1,15 @@
+- MainController
+    - ThermalCamera1 (front) 0 BUS
+    - PIR data 3 BUS
+    - IMU data
+    - 192.168.121.161:81
+- DistanceSensor
+    - Separate it from the main controller.
+    - maybe because of lacking power suply, it doesn't work with the hub.
+    - ws://192.168.121.188:82
+- ThermalCamera2(back)
+    - ws://192.168.121.:84
+- ThermalCamera3(right)
+    - ws://192.168.121.44:85
+- ThermalCamera4(left)
+    - ws://192.168.121.139:86

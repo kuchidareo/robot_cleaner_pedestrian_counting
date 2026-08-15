@@ -9,11 +9,11 @@
 /*static const char* WIFI_SSID     = "";
 static const char* WIFI_PASSWORD = "";*/
 
-static const char* WIFI_SSID     = "RoombaSense";
-static const char* WIFI_PASSWORD = "Asdf1234";
+static const char* WIFI_SSID     = "kalev-bitter-70";
+static const char* WIFI_PASSWORD = "shutakjp";
 
 //———————— WebSocket Setup ——————————
-static const uint16_t WS_PORT = 86;
+static const uint16_t WS_PORT = 85;
 
 WebSocketsServer webSocket(WS_PORT);
 Adafruit_MLX90640 mlx;

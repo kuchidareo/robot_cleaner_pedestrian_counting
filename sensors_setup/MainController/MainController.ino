@@ -3,183 +3,31 @@
 #include <Adafruit_MLX90640.h>
 #include <WiFi.h>
 #include <WebSocketsServer.h>
-#include "M5_STHS34PF80.h"
-#include <math.h>
+#include <string.h>
 
-// ——— Configuration ————————————————————————————
-/*static const char*   WIFI_SSID     = "";
-static const char*   WIFI_PASSWORD = "";*/
+static const char* WIFI_SSID = "RoombaSense";
+static const char* WIFI_PASSWORD = "Asdf1234";
+static const uint16_t WS_PORT = 81;
 
-// === WebSocket server settings ===
-static const uint16_t WS_PORT      = 81;
+static const uint8_t MLX_COLS = 32;
+static const uint8_t MLX_ROWS = 24;
+static const uint32_t SEND_INTERVAL_MS = 200;
 
-static const char*   WIFI_SSID     = "kalev-bitter-70";
-static const char*   WIFI_PASSWORD = "shutakjp";
-
-static const uint8_t I2C_MUX_ADDR  = 0x70;  // TCA9548A address
-
-static const uint8_t MLX_I2C_ADDR  = 0x33;
-static const uint8_t MLX1_BUS      = 0;   // first camera
-
-static const uint8_t PIR_I2C_ADDR  = 0x5A;
-static const uint8_t PIR_BUS       = 3;   // I2C mux channel for PIR
-
-static const uint8_t MLX_COLS      = 32;
-static const uint8_t MLX_ROWS      = 24;
-static const float   FRAME_DELAY   = 100;   // ms between frames
-
-int16_t motionVal        = 0;
-int16_t presenceVal      = 0;
-float   ambientTemp      = 0.0;
-
-// IMU values to transmit (converted units)
-float gyroX_dps = 0.0;
-float gyroY_dps = 0.0;
-float gyroZ_dps = 0.0;
-float accelX_mps2 = 0.0;
-float accelY_mps2 = 0.0;
-float accelZ_mps2 = 0.0;
-
-// ——— Globals ————————————————————————————————————————
-WebSocketsServer  webSocket(WS_PORT);
-
-// one thermal camera object and one buffer:
-Adafruit_MLX90640 mlx1;
-M5_STHS34PF80 tmos;
-float pixels1[MLX_COLS * MLX_ROWS];
-bool  hasThermalFrame = false;
-bool  thermalSensorAvailable = false;
-bool  pirSensorAvailable = false;
+WebSocketsServer webSocket(WS_PORT);
+Adafruit_MLX90640 mlx;
 static volatile uint8_t wsClientCount = 0;
-bool  reportedMissingThermalSensor = false;
-uint32_t lastWsStatusLogMs = 0;
+float pixels[MLX_COLS * MLX_ROWS];
 
-// --- Compact binary packet (no CSV/JSON on-device) ---------------------------
-// Packet layout (little-endian):
-//  Header: uint16 cols, uint16 rows
-//  Meta:   int16 motion, int16 presence,
-//          float ambient,
-//          float gyroX_dps, float gyroY_dps, float gyroZ_dps,
-//          float accelX_mps2, accelY_mps2, accelZ_mps2
-//  Data:   float pixels1[cols*rows]
 struct __attribute__((packed)) PacketHeader {
   uint16_t cols;
   uint16_t rows;
 };
 
-// NOTE: Keep this in sync with what `sendMainPacket()` actually packs.
-// Packed meta fields (current):
-//   int16 motion, int16 presence,
-//   float ambient,
-//   float gyroX_dps, gyroY_dps, gyroZ_dps,
-//   float accelX_mps2, accelY_mps2, accelZ_mps2
 static constexpr size_t N_PIXELS = (size_t)MLX_COLS * (size_t)MLX_ROWS;
-static constexpr size_t BYTES_HEADER = sizeof(PacketHeader);
-static constexpr size_t BYTES_META   = sizeof(int16_t) * 2 + sizeof(float) * 7; // 2 int16 + 7 floats
-static constexpr size_t BYTES_DATA   = (N_PIXELS * sizeof(float));               // one camera
-static constexpr size_t PACKET_BYTES = BYTES_HEADER + BYTES_META + BYTES_DATA;
+static constexpr size_t IMU_VALUE_COUNT = 6;
+static constexpr size_t PACKET_BYTES =
+    sizeof(PacketHeader) + IMU_VALUE_COUNT * sizeof(float) + N_PIXELS * sizeof(float);
 
-// Sanity check: header(4) + meta(32) + data(3072) = 3108 bytes for 32x24 floats
-static_assert(PACKET_BYTES == (sizeof(PacketHeader) + (sizeof(int16_t) * 2) + (sizeof(float) * 7) + (N_PIXELS * sizeof(float))),
-              "PACKET_BYTES mismatch: update BYTES_META/PACKET_BYTES to match sendMainPacket()");
-
-
-
-// ——— Function Prototypes ————————————————————————
-void connectToWiFi();
-void initDisplay();
-void initThermalCameras();
-void initThermalFrameBuffer();
-void initOtherSensors();
-void selectMux(uint8_t ch);
-void scanI2COnMux();
-bool readThermalFrame();
-void sendMainPacket();
-void readPIR();
-void readIMU();
-void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
-
-// ——— Setup ——————————————————————————————————————
-void setup() {
-  M5.begin();
-  Serial.begin(115200);
-
-  Wire.begin(/* SDA */ 32, /* SCL */ 33, 400000);
-
-  connectToWiFi();
-  initDisplay();
-
-  webSocket.begin();
-  webSocket.onEvent(handleWebSocketEvent);
-  Serial.printf("[WS] listening on port %u\n", WS_PORT);
-
-  scanI2COnMux();
-  
-  initThermalCameras();
-  initThermalFrameBuffer();
-  initOtherSensors();
-}
-
-// ——— Main Loop ————————————————————————————————————
-void loop() {
-  webSocket.loop();
-
-  readPIR();
-  readIMU();
-
-  const bool thermalFrameUpdated = readThermalFrame();
-  if (!thermalFrameUpdated) {
-    if (thermalSensorAvailable) {
-      if (hasThermalFrame) {
-        Serial.println("Warning: thermal read failed, sending cached thermal frame");
-      } else {
-        Serial.println("Warning: thermal read failed, sending NaN thermal frame");
-      }
-    } else if (!reportedMissingThermalSensor) {
-      Serial.println("Warning: thermal sensor unavailable, continuing without thermal data");
-      reportedMissingThermalSensor = true;
-    }
-  }
-
-  sendMainPacket();
-
-  const uint32_t nowMs = millis();
-  if (wsClientCount == 0 && (nowMs - lastWsStatusLogMs >= 5000)) {
-    lastWsStatusLogMs = nowMs;
-    Serial.printf("[WS] waiting for a client on port %u\n", WS_PORT);
-  }
-
-  delay(FRAME_DELAY);
-}
-
-void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED:
-      wsClientCount++;
-      Serial.printf("[WS] client #%u connected (clients=%u)\n", num, wsClientCount);
-      break;
-    case WStype_DISCONNECTED:
-      if (wsClientCount > 0) {
-        wsClientCount--;
-      }
-      Serial.printf("[WS] client #%u disconnected (clients=%u)\n", num, wsClientCount);
-      break;
-    case WStype_ERROR:
-      Serial.printf("[WS] error from client #%u (len=%u)\n", num, (unsigned)length);
-      break;
-    default:
-      break;
-  }
-}
-// ——— Implementations ———————————————————————————
-// Selects which channel on the TCA9548A I2C multiplexer to use
-void selectMux(uint8_t ch) {
-  Wire.beginTransmission(I2C_MUX_ADDR);
-  Wire.write(1 << ch);
-  Wire.endTransmission();
-}
-
-// Connects to WiFi and prints the IP on Serial
 void connectToWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -194,193 +42,86 @@ void connectToWiFi() {
   Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
 }
 
-// Sets up the LCD to show IP address
-void initDisplay() {
-  M5.Lcd.setRotation(3);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.setCursor(0, 20);
-  M5.Lcd.println("IP:");
-  M5.Lcd.println(WiFi.localIP());
-}
-
-// Initializes the MLX90640 sensor over the I2C multiplexer
-void initThermalCameras() {
-  selectMux(MLX1_BUS);
-  if (!mlx1.begin(MLX_I2C_ADDR, &Wire)) {
-    thermalSensorAvailable = false;
-    Serial.println("Warning: MLX90640 #1 not detected, continuing without thermal sensor");
-    return;
-  }
-  thermalSensorAvailable = true;
-  mlx1.setMode(MLX90640_CHESS);
-  mlx1.setResolution(MLX90640_ADC_18BIT);
-  mlx1.setRefreshRate(MLX90640_8_HZ);
-  Serial.println("MLX90640 #1 initialized");
-}
-
-void initThermalFrameBuffer() {
-  for (size_t i = 0; i < N_PIXELS; ++i) {
-    pixels1[i] = NAN;
+void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      wsClientCount++;
+      Serial.printf("[WS] client #%u connected\n", num);
+      break;
+    case WStype_DISCONNECTED:
+      if (wsClientCount > 0) {
+        wsClientCount--;
+      }
+      Serial.printf("[WS] client #%u disconnected\n", num);
+      break;
+    case WStype_ERROR:
+      Serial.printf("[WS] error from client #%u (len=%u)\n", num, (unsigned)length);
+      break;
+    default:
+      break;
   }
 }
 
-void initOtherSensors() {
+void setup() {
+  M5.begin();
+  Serial.begin(115200);
+  Wire.begin(32, 33);  // Direct pins: SDA=32, SCL=33
   M5.IMU.Init();
-  Serial.println("IMU initialized");
 
-  // PIR/Temp
-  selectMux(PIR_BUS);
-  tmos.begin(&Wire, PIR_I2C_ADDR);
-  tmos.setGainMode(STHS34PF80_GAIN_DEFAULT_MODE);
-  tmos.setMotionThreshold(0xFF);
-  tmos.setPresenceThreshold(0xC8);
-  tmos.setMotionHysteresis(0x32);
-  tmos.setPresenceHysteresis(0x32);
-  pirSensorAvailable = true;
-  Serial.println("PIR sensor initialized");
+  if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
+    Serial.println("Failed to find MLX90640 sensor");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  mlx.setMode(MLX90640_CHESS);
+  mlx.setResolution(MLX90640_ADC_18BIT);
+  mlx.setRefreshRate(MLX90640_4_HZ);
+
+  connectToWiFi();
+  webSocket.begin();
+  webSocket.onEvent(onWsEvent);
+  Serial.printf("WebSocket server listening on port %u\n", WS_PORT);
 }
 
-void readPIR() {
-  if (!pirSensorAvailable) {
-    motionVal = 0;
-    presenceVal = 0;
-    ambientTemp = NAN;
+void loop() {
+  webSocket.loop();
+  if (wsClientCount == 0) {
+    delay(10);
     return;
   }
 
-  // STHS34PF80 (presence/motion/ambient) on mux bus 3
-  selectMux(PIR_BUS);
-  tmos.getPresenceValue(&presenceVal);
-  tmos.getMotionValue(&motionVal);
-  tmos.getTemperatureData(&ambientTemp);
-}
+  if (mlx.getFrame(pixels) != 0) {
+    Serial.println("Failed to get thermal frame");
+    delay(10);
+    return;
+  }
 
-void readIMU(){
   float gx, gy, gz;
   float ax, ay, az;
-
-  // Get gyroscope and accelerometer data
   M5.IMU.getGyroData(&gx, &gy, &gz);
   M5.IMU.getAccelData(&ax, &ay, &az);
 
-  // Convert gyroscope data to deg/s (library units depend on IMU configuration)
-  gyroX_dps = gx / 131.0;
-  gyroY_dps = gy / 131.0;
-  gyroZ_dps = gz / 131.0;
+  const float imuValues[IMU_VALUE_COUNT] = {
+      gx / 131.0f,
+      gy / 131.0f,
+      gz / 131.0f,
+      ax * 9.81f,
+      ay * 9.81f,
+      az * 9.81f,
+  };
 
-  // Convert accelerometer data to m/s²
-  accelX_mps2 = ax * 9.81;
-  accelY_mps2 = ay * 9.81;
-  accelZ_mps2 = az * 9.81;
-}
+  const PacketHeader header = {MLX_COLS, MLX_ROWS};
+  uint8_t buffer[PACKET_BYTES];
+  size_t offset = 0;
 
-// Reads one frame from the MLX90640 into the cached pixels buffer.
-// Returns true only when a fresh frame was captured successfully.
-bool readThermalFrame() {
-  if (!thermalSensorAvailable) {
-    return false;
-  }
+  memcpy(buffer + offset, &header, sizeof(header));
+  offset += sizeof(header);
+  memcpy(buffer + offset, imuValues, sizeof(imuValues));
+  offset += sizeof(imuValues);
+  memcpy(buffer + offset, pixels, sizeof(pixels));
 
-  selectMux(MLX1_BUS);
-  if (mlx1.getFrame(pixels1) != 0) {
-    Serial.println("Error: failed to read MLX90640 #1");
-    return false;
-  }
-  hasThermalFrame = true;
-  return true;
-}
-
-// Builds and broadcasts the compact binary packet using the latest sensor values.
-// Thermal data is sent from the cached frame buffer so a failed MLX read does not
-// block PIR/IMU transmission. Before the first successful read the buffer contains NaNs.
-void sendMainPacket() {
-  if (wsClientCount == 0) {
-    return;
-  }
-
-  PacketHeader hdr;
-  hdr.cols = MLX_COLS;
-  hdr.rows = MLX_ROWS;
-
-  const int16_t motion   = motionVal;
-  const int16_t presence = presenceVal;
-  const float   ambient  = ambientTemp;
-
-  const float gX = gyroX_dps;
-  const float gY = gyroY_dps;
-  const float gZ = gyroZ_dps;
-  const float aX = accelX_mps2;
-  const float aY = accelY_mps2;
-  const float aZ = accelZ_mps2;
-
-  // Allocate a buffer on the stack (fixed size)
-  uint8_t buf[PACKET_BYTES];
-  size_t off = 0;
-
-  // Guard against accidental size mismatches (would cause stack smashing)
-  if (PACKET_BYTES > sizeof(buf)) {
-    Serial.printf("[ERR] PACKET_BYTES(%u) > buf(%u)\n", (unsigned)PACKET_BYTES, (unsigned)sizeof(buf));
-    return;
-  }
-
-  memcpy(buf + off, &hdr, sizeof(hdr));
-  off += sizeof(hdr);
-
-  memcpy(buf + off, &motion, sizeof(motion));
-  off += sizeof(motion);
-
-  memcpy(buf + off, &presence, sizeof(presence));
-  off += sizeof(presence);
-
-  memcpy(buf + off, &ambient, sizeof(ambient));
-  off += sizeof(ambient);
-
-  memcpy(buf + off, &gX, sizeof(gX));
-  off += sizeof(gX);
-  memcpy(buf + off, &gY, sizeof(gY));
-  off += sizeof(gY);
-  memcpy(buf + off, &gZ, sizeof(gZ));
-  off += sizeof(gZ);
-
-  memcpy(buf + off, &aX, sizeof(aX));
-  off += sizeof(aX);
-  memcpy(buf + off, &aY, sizeof(aY));
-  off += sizeof(aY);
-  memcpy(buf + off, &aZ, sizeof(aZ));
-  off += sizeof(aZ);
-
-  memcpy(buf + off, pixels1, N_PIXELS * sizeof(float));
-  off += N_PIXELS * sizeof(float);
-
-  // Final consistency check
-  if (off != PACKET_BYTES) {
-    Serial.printf("[ERR] Packed size mismatch: off=%u PACKET_BYTES=%u\n", (unsigned)off, (unsigned)PACKET_BYTES);
-    return;
-  }
-
-  // Broadcast as binary
-  webSocket.broadcastBIN(buf, PACKET_BYTES);
-}
-
-// DEBUG
-void scanI2COnMux() {
-  Serial.println("=== I2C scan on each TCA9548A channel ===");
-  for (uint8_t ch = 0; ch < 8; ch++) {
-    selectMux(ch);
-    delay(10);
-
-    Serial.printf("CH %u: ", ch);
-    bool foundAny = false;
-
-    for (uint8_t addr = 1; addr < 127; addr++) {
-      Wire.beginTransmission(addr);
-      if (Wire.endTransmission() == 0) {
-        Serial.printf("0x%02X ", addr);
-        foundAny = true;
-      }
-    }
-    if (!foundAny) Serial.print("(none)");
-    Serial.println();
-  }
-  Serial.println("========================================");
+  webSocket.broadcastBIN(buffer, PACKET_BYTES);
+  delay(SEND_INTERVAL_MS);
 }

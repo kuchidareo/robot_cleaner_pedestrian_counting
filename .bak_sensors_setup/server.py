@@ -1,10 +1,11 @@
 import asyncio
 import csv
 import os
-import socket
 import struct
 import time
 from dataclasses import dataclass
+from typing import Dict
+import socket
 
 import numpy as np
 import websockets
@@ -22,17 +23,23 @@ LOG_INTERVAL_SECONDS = 10.0
 
 PORTS = {
     "main": 81,
+    "distance": 82,
     "thermal2": 84,
     "thermal3": 85,
     "thermal4": 86,
+    "timercam1": 87,
+    "timercam2": 88,
+    "timercam3": 89,
+    "timercam4": 90,
 }
 
 DISCOVERY_TIMEOUT_SECONDS = 0.5
 DISCOVERY_CONCURRENCY = 64
 DISCOVERY_RETRY_DELAY_SECONDS = 2.0
 
+THERMAL_NAMES = {"main", "thermal2", "thermal3", "thermal4"}
 THERMAL_ONLY_NAMES = {"thermal2", "thermal3", "thermal4"}
-
+TIMERCAM_NAMES = {"timercam1", "timercam2", "timercam3", "timercam4"}
 
 def websocket_url(name: str, host: str) -> str:
     port = PORTS[name]
@@ -96,6 +103,21 @@ async def discover_host_for_port(name: str, port: int, subnet_prefix: str) -> st
     return None
 
 
+async def discover_device_hosts() -> Dict[str, str]:
+    subnet_prefix = local_subnet_prefix()
+    # print(f"Discovering devices on {subnet_prefix}.0/24")
+
+    hosts: Dict[str, str] = {}
+    for name, port in PORTS.items():
+        host = await discover_host_for_port(name, port, subnet_prefix)
+        if host is None:
+            continue
+        hosts[name] = host
+        # print(f"Discovered: {name} -> {host}:{port}")
+
+    return hosts
+
+
 async def discover_single_device(name: str) -> str:
     port = PORTS[name]
     while True:
@@ -107,7 +129,8 @@ async def discover_single_device(name: str) -> str:
         await asyncio.sleep(DISCOVERY_RETRY_DELAY_SECONDS)
 
 HDR = struct.Struct("<HH")
-MAIN_META = struct.Struct("<6f")
+DISTANCE_PACKET = struct.Struct("<f")
+MAIN_META = struct.Struct("<hh" + "f" * 7)
 
 BYTES_THERMAL = N_PIXELS * 4
 BYTES_MAIN_PACKET = HDR.size + MAIN_META.size + BYTES_THERMAL
@@ -116,6 +139,9 @@ BYTES_THERMAL_PACKET = HDR.size + BYTES_THERMAL
 
 @dataclass
 class MainPacket:
+    motion: int
+    presence: int
+    ambient: float
     gyro_x: float
     gyro_y: float
     gyro_z: float
@@ -165,11 +191,14 @@ def decode_main_packet(payload: bytes) -> MainPacket:
         raise ValueError(f"main frame size mismatch: got {cols}x{rows}, expected {FRAME_WIDTH}x{FRAME_HEIGHT}")
 
     off = HDR.size
-    gx, gy, gz, ax, ay, az = MAIN_META.unpack_from(payload, off)
+    motion, presence, ambient, gx, gy, gz, ax, ay, az = MAIN_META.unpack_from(payload, off)
     off += MAIN_META.size
     thermal = np.frombuffer(payload, dtype="<f4", count=N_PIXELS, offset=off).copy()
 
     return MainPacket(
+        motion=int(motion),
+        presence=int(presence),
+        ambient=float(ambient),
         gyro_x=float(gx),
         gyro_y=float(gy),
         gyro_z=float(gz),
@@ -213,10 +242,14 @@ def maybe_log_status(
     return 0, now
 
 
-async def handle_main(websocket, sinks: dict[str, CsvSink]) -> None:
+async def handle_main(websocket, sinks: Dict[str, CsvSink]) -> None:
     count = 0
     window_count = 0
     window_started_at = time.monotonic()
+    peer = getattr(websocket, "remote_address", None)
+    # print(f"[main] connected from {peer}")
+    # print(f"[main] expecting {BYTES_MAIN_PACKET} bytes")
+
     async for payload in websocket:
         if isinstance(payload, str):
             print("[main] ignoring text payload")
@@ -239,6 +272,13 @@ async def handle_main(websocket, sinks: dict[str, CsvSink]) -> None:
             f"{pkt.accel_y:.6f}",
             f"{pkt.accel_z:.6f}",
         ])
+        sinks["main_pir"].write([
+            f"{ts:.6f}",
+            pkt.motion,
+            pkt.presence,
+            f"{pkt.ambient:.6f}",
+        ])
+
         count += 1
         window_count += 1
         mn, mx = frame_min_max(pkt.thermal)
@@ -249,8 +289,39 @@ async def handle_main(websocket, sinks: dict[str, CsvSink]) -> None:
             window_started_at=window_started_at,
             last_message=(
                 f"bytes={len(payload)} thermal[min,max]=({mn:.1f},{mx:.1f}) "
+                f"motion={pkt.motion} presence={pkt.presence} ambient={pkt.ambient:.2f} "
                 f"gyro=({pkt.gyro_x:.2f},{pkt.gyro_y:.2f},{pkt.gyro_z:.2f})"
             ),
+        )
+
+
+async def handle_distance(websocket, sink: CsvSink) -> None:
+    count = 0
+    window_count = 0
+    window_started_at = time.monotonic()
+    peer = getattr(websocket, "remote_address", None)
+    # print(f"[distance] connected from {peer}")
+
+    async for payload in websocket:
+        if isinstance(payload, str):
+            print("[distance] ignoring text payload")
+            continue
+        if len(payload) != DISTANCE_PACKET.size:
+            print(f"[distance] bad packet size: {len(payload)}")
+            continue
+
+        ts = now_ts()
+        (distance_cm,) = DISTANCE_PACKET.unpack(payload)
+        sink.write([f"{ts:.6f}", f"{float(distance_cm):.6f}"])
+
+        count += 1
+        window_count += 1
+        window_count, window_started_at = maybe_log_status(
+            name="distance",
+            total_count=count,
+            window_count=window_count,
+            window_started_at=window_started_at,
+            last_message=f"distance_cm={float(distance_cm):.2f}",
         )
 
 
@@ -258,6 +329,10 @@ async def handle_thermal(websocket, name: str, sink: CsvSink) -> None:
     count = 0
     window_count = 0
     window_started_at = time.monotonic()
+    peer = getattr(websocket, "remote_address", None)
+    # print(f"[{name}] connected from {peer}")
+    # print(f"[{name}] expecting {BYTES_THERMAL_PACKET} bytes")
+
     async for payload in websocket:
         if isinstance(payload, str):
             print(f"[{name}] ignoring text payload")
@@ -284,7 +359,38 @@ async def handle_thermal(websocket, name: str, sink: CsvSink) -> None:
         )
 
 
-def make_csv_sinks(out_dir: str) -> dict[str, CsvSink]:
+async def handle_timercam(websocket, name: str, csv_sink: CsvSink, image_dir: str) -> None:
+    count = 0
+    window_count = 0
+    window_started_at = time.monotonic()
+    peer = getattr(websocket, "remote_address", None)
+    # print(f"[{name}] connected from {peer}")
+
+    async for payload in websocket:
+        if isinstance(payload, str):
+            print(f"[{name}] ignoring text payload")
+            continue
+
+        ts = now_ts()
+        filename = f"{name}_{int(ts * 1000000)}.jpg"
+        image_path = os.path.join(image_dir, filename)
+        with open(image_path, "wb") as fh:
+            fh.write(payload)
+
+        csv_sink.write([f"{ts:.6f}", filename, str(len(payload))])
+
+        count += 1
+        window_count += 1
+        window_count, window_started_at = maybe_log_status(
+            name=name,
+            total_count=count,
+            window_count=window_count,
+            window_started_at=window_started_at,
+            last_message=f"jpeg_bytes={len(payload)} file={filename}",
+        )
+
+
+def make_csv_sinks(out_dir: str) -> Dict[str, CsvSink]:
     thermal_header = ["timestamp"] + [f"p{i}" for i in range(N_PIXELS)]
     sinks = {
         "main": CsvSink(os.path.join(out_dir, "main.csv"), thermal_header),
@@ -292,21 +398,37 @@ def make_csv_sinks(out_dir: str) -> dict[str, CsvSink]:
             os.path.join(out_dir, "main_imu.csv"),
             ["timestamp", "gyro_x_dps", "gyro_y_dps", "gyro_z_dps", "accel_x_mps2", "accel_y_mps2", "accel_z_mps2"],
         ),
+        "main_pir": CsvSink(
+            os.path.join(out_dir, "main_pir.csv"),
+            ["timestamp", "motion", "presence", "ambient"],
+        ),
+        "distance": CsvSink(os.path.join(out_dir, "distance.csv"), ["timestamp", "distance_cm"]),
         "thermal2": CsvSink(os.path.join(out_dir, "thermal2.csv"), thermal_header),
         "thermal3": CsvSink(os.path.join(out_dir, "thermal3.csv"), thermal_header),
         "thermal4": CsvSink(os.path.join(out_dir, "thermal4.csv"), thermal_header),
     }
 
+    for name in TIMERCAM_NAMES:
+        sinks[name] = CsvSink(os.path.join(out_dir, f"{name}.csv"), ["timestamp", "filename", "bytes"])
+
     return sinks
 
 
-async def dispatch(websocket, *, name: str, sinks: dict[str, CsvSink]) -> None:
+async def dispatch(websocket, *, name: str, sinks: Dict[str, CsvSink], out_dir: str) -> None:
     try:
         if name == "main":
             await handle_main(websocket, sinks)
             return
+        if name == "distance":
+            await handle_distance(websocket, sinks["distance"])
+            return
         if name in THERMAL_ONLY_NAMES:
             await handle_thermal(websocket, name, sinks[name])
+            return
+        if name in TIMERCAM_NAMES:
+            image_dir = os.path.join(out_dir, name)
+            os.makedirs(image_dir, exist_ok=True)
+            await handle_timercam(websocket, name, sinks[name], image_dir)
             return
         print(f"[{name}] no handler")
     except websockets.ConnectionClosed as exc:
@@ -334,7 +456,7 @@ async def main() -> None:
                 # print(f"[{name}] connecting to {url}")
                 async with websockets.connect(url, ping_interval=None, max_size=None) as websocket:
                     # print(f"[{name}] connected to {url}")
-                    await dispatch(websocket, name=name, sinks=sinks)
+                    await dispatch(websocket, name=name, sinks=sinks, out_dir=out_dir)
             except Exception as exc:
                 print(f"[{name}] connection error: {exc}")
 

@@ -9,8 +9,8 @@
 /*static const char* WIFI_SSID     = "";
 static const char* WIFI_PASSWORD = "";*/
 
-static const char* WIFI_SSID     = "kalev-bitter-70";
-static const char* WIFI_PASSWORD = "shutakjp";
+static const char* WIFI_SSID     = "RoombaSense";
+static const char* WIFI_PASSWORD = "Asdf1234";
 
 //———————— WebSocket Setup ——————————
 static const uint16_t WS_PORT = 84;
@@ -46,7 +46,7 @@ float pixels1[MLX_COLS * MLX_ROWS];  // MLX90640 resolution
 
 void setup() {
   M5.begin();
-  Wire.begin(32, 33);
+  Wire.begin(0, 26);  // Cable/Thermal Hat: SDA=0, SCL=26
   Serial.begin(115200);
   esp_log_level_set("wifi", ESP_LOG_NONE);
   delay(1000);
