@@ -3,3 +3,7 @@ pycryptodome
 charset-normalizer
 Pillow
 colorama
+vacuum-map-parser-base==0.1.5
+vacuum-map-parser-xiaomi==0.1.3
+matplotlib
+numpy

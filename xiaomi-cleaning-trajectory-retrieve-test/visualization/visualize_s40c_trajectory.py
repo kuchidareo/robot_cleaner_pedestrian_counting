@@ -8,16 +8,17 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FFMpegWriter, FuncAnimation
 
 
-def load_points(csv_file: Path) -> tuple[list[float], list[float], list[float]]:
-    x, y, angles = [], [], []
+def load_points(csv_file: Path) -> tuple[list[float], list[float], list[float], list[str]]:
+    x, y, angles, timestamps = [], [], [], []
     with csv_file.open(newline="") as source:
         for row in csv.DictReader(source):
             x.append(float(row["x"]))
             y.append(float(row["y"]))
             angles.append(float(row["angle_degrees"]))
+            timestamps.append(row.get("timestamp_local", ""))
     if not x:
         raise ValueError(f"No trajectory points found in {csv_file}")
-    return x, y, angles
+    return x, y, angles, timestamps
 
 
 def main() -> None:
@@ -28,7 +29,7 @@ def main() -> None:
     parser.add_argument("--fps", type=int, default=30)
     args = parser.parse_args()
 
-    x, y, angles = load_points(Path(args.csv_file))
+    x, y, angles, timestamps = load_points(Path(args.csv_file))
     frame_count = max(2, round(args.duration * args.fps))
     point_for_frame = [round(i * (len(x) - 1) / (frame_count - 1)) for i in range(frame_count)]
 
@@ -59,7 +60,8 @@ def main() -> None:
             [x[index], x[index] + arrow_length * math.cos(angle)],
             [y[index], y[index] + arrow_length * math.sin(angle)],
         )
-        counter.set_text(f"Point {index + 1:,} / {len(x):,}")
+        timestamp = timestamps[index].replace("T", " ") if timestamps[index] else "Timestamp unavailable"
+        counter.set_text(f"{timestamp}\nPoint {index + 1:,} / {len(x):,}")
         return trail, vacuum, direction, counter
 
     animation = FuncAnimation(fig, update, frames=frame_count, interval=1000 / args.fps, blit=True)

@@ -8,5 +8,14 @@
     "x": -16,
     "y": -310,
     "a": 47.11
+  },
+  "timestamps": {
+    "method": "uniform interpolation",
+    "start_utc": "2026-08-12T08:37:03+00:00",
+    "start_local": "2026-08-12T11:37:03+03:00",
+    "end_local": "2026-08-12T12:05:18+03:00",
+    "duration_seconds": 1695,
+    "timezone": "Europe/Tallinn",
+    "estimated_interval_seconds": 1.5423111919927206
   }
 }
