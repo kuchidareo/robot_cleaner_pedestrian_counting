@@ -25,13 +25,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Extract an S40C cleaning path from a downloaded cloud map")
     parser.add_argument("map_file", nargs="?", default="logs/s40c_map.zlib.enc")
     parser.add_argument("--token-file", default=".token")
-    parser.add_argument("--csv", default="logs/s40c_trajectory.csv")
-    parser.add_argument("--metadata", default="logs/s40c_trajectory_metadata.json")
-    parser.add_argument("--clean-record", default="logs/s40c_clean_record.json")
+    parser.add_argument("--csv")
+    parser.add_argument("--metadata")
+    parser.add_argument("--clean-record")
     parser.add_argument("--timezone", default="Europe/Tallinn")
     args = parser.parse_args()
 
-    wrapped_map = json.loads(Path(args.map_file).read_bytes())
+    map_path = Path(args.map_file)
+    output_directory = map_path.parent
+    csv_path = Path(args.csv) if args.csv else output_directory / "s40c_trajectory.csv"
+    metadata_path = (
+        Path(args.metadata)
+        if args.metadata else output_directory / "s40c_trajectory_metadata.json"
+    )
+    clean_record_path = (
+        Path(args.clean_record)
+        if args.clean_record else map_path.parent / "s40c_clean_record.json"
+    )
+
+    wrapped_map = json.loads(map_path.read_bytes())
     encrypted_map = base64.b64decode(wrapped_map["data"]).hex()
     device_id = read_device_id(Path(args.token_file))
 
@@ -45,7 +57,6 @@ def main() -> None:
 
     start_utc = None
     duration_seconds = None
-    clean_record_path = Path(args.clean_record)
     if clean_record_path.exists():
         clean_record = json.loads(clean_record_path.read_text())
         history = clean_record.get("history_list", [])
@@ -53,8 +64,6 @@ def main() -> None:
             start_utc = datetime.fromtimestamp(history[0]["stime"], timezone.utc)
             duration_seconds = int(history[0]["label"].split("_", 1)[0])
 
-    csv_path = Path(args.csv)
-    metadata_path = Path(args.metadata)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
 

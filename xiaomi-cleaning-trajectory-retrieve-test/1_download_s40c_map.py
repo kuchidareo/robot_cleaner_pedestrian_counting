@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 import json
+from datetime import datetime
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
-from token_extractor import QrCodeXiaomiCloudConnector, args
+
+token_module_path = Path(__file__).with_name("0_token_extractor.py")
+token_module_spec = spec_from_file_location("token_extractor", token_module_path)
+token_module = module_from_spec(token_module_spec)
+token_module_spec.loader.exec_module(token_module)
+QrCodeXiaomiCloudConnector = token_module.QrCodeXiaomiCloudConnector
+args = token_module.args
 
 
 MODEL = "xiaomi.vacuum.e101gb"
@@ -87,7 +95,13 @@ def download_object(connector, server, did, object_name, output):
 
 def main():
     server = args.server or "de"
-    output = args.output or "logs/s40c_map.zlib.enc"
+    if args.output:
+        output = Path(args.output)
+        run_directory = output.parent
+    else:
+        run_directory = Path("logs") / datetime.now().strftime("%Y%m%d%H%M%S")
+        output = run_directory / "s40c_map.zlib.enc"
+    run_directory.mkdir(parents=True, exist_ok=True)
 
     connector = QrCodeXiaomiCloudConnector()
     if not connector.login():
@@ -103,7 +117,7 @@ def main():
 
     download_object(connector, server, vacuum["did"], properties["map"], output)
     if "clean_record" in properties:
-        record_output = Path("logs/s40c_clean_record.json")
+        record_output = run_directory / "s40c_clean_record.json"
         record_output.write_text(json.dumps(properties["clean_record"], indent=2) + "\n")
         print(f"Saved cleaning record to {record_output}")
     else:
@@ -115,10 +129,16 @@ def main():
             server,
             vacuum["did"],
             properties["trajectory"],
-            "logs/s40c_trajectory.zlib.enc",
+            run_directory / "s40c_trajectory.zlib.enc",
         )
     else:
         print("Xiaomi Cloud did not return a separate trajectory object name")
+
+    print(f"Saved this download under {run_directory}")
+    print(
+        "Extract it with:\n"
+        f"  python 2_extract_s40c_trajectory.py {output}"
+    )
 
 
 if __name__ == "__main__":

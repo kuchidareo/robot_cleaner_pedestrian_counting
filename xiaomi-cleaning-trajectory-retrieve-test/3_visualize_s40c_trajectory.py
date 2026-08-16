@@ -24,10 +24,11 @@ def load_points(csv_file: Path) -> tuple[list[float], list[float], list[float], 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render an S40C trajectory as an MP4 video")
     parser.add_argument("csv_file", nargs="?", default="logs/s40c_trajectory.csv")
-    parser.add_argument("--output", default="visualization/s40c_trajectory.mp4")
+    parser.add_argument("--output")
     parser.add_argument("--duration", type=float, default=30.0, help="Video duration in seconds")
     parser.add_argument("--fps", type=int, default=30)
     args = parser.parse_args()
+    output_path = Path(args.output) if args.output else Path(args.csv_file).parent / "s40c_trajectory.mp4"
 
     x, y, angles, timestamps = load_points(Path(args.csv_file))
     frame_count = max(2, round(args.duration * args.fps))
@@ -66,10 +67,10 @@ def main() -> None:
 
     animation = FuncAnimation(fig, update, frames=frame_count, interval=1000 / args.fps, blit=True)
     writer = FFMpegWriter(fps=args.fps, codec="libx264", bitrate=3000, extra_args=["-pix_fmt", "yuv420p"])
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    animation.save(args.output, writer=writer, dpi=150)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    animation.save(output_path, writer=writer, dpi=150)
     plt.close(fig)
-    print(f"Saved {frame_count} frames to {args.output}")
+    print(f"Saved {frame_count} frames to {output_path}")
 
 
 if __name__ == "__main__":
