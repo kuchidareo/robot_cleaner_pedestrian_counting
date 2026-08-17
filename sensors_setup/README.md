@@ -5,10 +5,10 @@ sensor, the TCA9548A multiplexer, and the PIR sensor are no longer used.
 
 | Device | Direction | Connection | I2C pins | WebSocket port |
 | --- | --- | --- | --- | --- |
-| MainController / Thermal 1 | Front | Direct pins | SDA 32, SCL 33 | 81 |
-| ThermalCamera2 | Back | Cable / Thermal Hat | SDA 0, SCL 26 | 84 |
-| ThermalCamera3 | Right | Direct pins | SDA 32, SCL 33 | 85 |
-| ThermalCamera4 | Left | Cable / Thermal Hat | SDA 0, SCL 26 | 86 |
+| MainController / Thermal 1 | Front | Direct pins | SDA 0, SCL 26 | 81 |
+| ThermalCamera2 | Back | Cable / Grove | SDA 32, SCL 33 | 84 |
+| ThermalCamera3 | Right | Direct pins | SDA 0, SCL 26 | 85 |
+| ThermalCamera4 | Left | Cable / Grove | SDA 32, SCL 33 | 86 |
 
 MainController also sends its built-in IMU measurements. Its binary packet is:
 
